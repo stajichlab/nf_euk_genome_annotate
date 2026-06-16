@@ -1,0 +1,4 @@
+SPECIES,STRAIN,ASMID,LOCUSTAG,BUSCO_LINEAGE,TRANSL_TABLE,NCBI_TAXONID,GENOME
+Saccharomyces cerevisiae,S288C,GCF_000146045.2,SACCER,saccharomycetes_odb10,1,559292,
+Aspergillus fumigatus,Af293,GCF_000002655.1,ASPFUM,eurotiomycetes_odb10,1,330879,
+Neurospora crassa,OR74A,GCF_000182925.2,NEUCRA,sordariomycetes_odb10,1,367110,

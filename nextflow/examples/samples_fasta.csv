@@ -1,0 +1,3 @@
+SPECIES,STRAIN,ASMID,LOCUSTAG,BUSCO_LINEAGE,TRANSL_TABLE,NCBI_TAXONID,GENOME
+Mortierella elongata,AG-77,MELO_AG77,MELO,mucoromycota_odb10,1,1314771,examples/genomes/Mortierella_elongata_AG-77.fasta
+Rhizopus microsporus,ATCC11559,RMIC_11559,RMIC,mucoromycota_odb10,1,86635,/path/to/assemblies/Rhizopus_microsporus.fa.gz
