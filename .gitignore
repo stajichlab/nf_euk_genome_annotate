@@ -11,6 +11,12 @@ input_clean_genomes/
 rnaseq_reads/
 rnaseq_data/
 results/
+# test-run artifacts (keep tests/data fixtures)
+nextflow/tests/work/
+nextflow/tests/output/
+nextflow/tests/data/*.rnaseq_sra.csv
+# scratch copies
+*.orig
 # python
 __pycache__/
 *.pyc
