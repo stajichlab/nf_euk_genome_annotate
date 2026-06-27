@@ -4,11 +4,13 @@
  * SOURCE: ../../../1KFG/common_annotate/pipeline/nextflow/funannotate.nf
  * Last synced: 2026-05-23
  * Changes vs source: removed nextflow.enable.dsl=2; params block moved to
- *                    conf/profile_funannotate.config.
+ *                    conf/profile_annotate.config.
  *
- * Usage (from project root):
- *   sbatch nextflow/run_funannotate.sh
- *   nextflow run nextflow/funannotate.nf -c nextflow/nextflow.config -profile funannotate -resume
+ * Usage (from project root — a pipeline profile is REQUIRED; without it
+ * params.taxondb / params.funannotate_db are null and parsing fails):
+ *   sbatch nextflow/run_annotate.sh
+ *   nextflow run nextflow/funannotate.nf -c nextflow/nextflow.config \
+ *       -profile annotate,slurm,module -resume
  */
 
 // Metadata tuple order used throughout:
@@ -80,7 +82,9 @@ process SETUP_TAXONDB {
 // at a prebuilt shared DB) the task is skipped entirely but still emits `db`.
 process SETUP_FUNANNOTATE_DB {
     label 'funannotate'
-    storeDir file(params.funannotate_db).parent
+    // Closure defers evaluation to task runtime so a missing pipeline profile is
+    // caught by the workflow guard (clear message) instead of throwing here.
+    storeDir { file(params.funannotate_db).parent }
 
     cpus   2
     memory '8 GB'
@@ -105,6 +109,65 @@ process SETUP_FUNANNOTATE_DB {
     mkdir -p ${db_dir}
     : > ${db_dir}/funannotate-db-info.txt
     echo "[STUB] SETUP_FUNANNOTATE_DB at ${db_dir}"
+    """
+}
+
+// Seed a writable AUGUSTUS_CONFIG copy at params.augustus_config from the installed
+// augustus config. Augustus (via funannotate train/predict) writes new species parameter
+// sets into its config dir, so it cannot use the read-only config that ships with a
+// module/conda/singularity install — every run needs its own writable copy. Runs under the
+// 'funannotate' label so the source is the augustus that the active provisioning profile
+// supplies; the install's config is located via AUGUSTUS_CONFIG_PATH (set by the module/
+// conda env) or by resolving ../config from the augustus binary, or an explicit override
+// (params.augustus_config_source). storeDir caches the populated dir at params.augustus_config,
+// so this runs at most once across all pipeline runs; if the directory already exists the
+// task is skipped entirely but still emits `config`.
+process SETUP_AUGUSTUS_CONFIG {
+    label 'funannotate'
+    // Closure defers evaluation to task runtime so a missing pipeline profile is
+    // caught by the workflow guard (clear message) instead of throwing here.
+    storeDir { file(params.augustus_config).parent }
+
+    cpus   1
+    memory '4 GB'
+    time   '1h'
+
+    output:
+    path "${cfg_dir}", emit: config
+
+    script:
+    cfg_dir = file(params.augustus_config).name
+    def override = params.augustus_config_source ? params.augustus_config_source : ''
+    """
+    set -euo pipefail
+
+    # Locate the installed augustus config to seed the writable copy.
+    SRC="${override}"
+    if [ -z "\$SRC" ] && [ -n "\${AUGUSTUS_CONFIG_PATH:-}" ] && [ -d "\${AUGUSTUS_CONFIG_PATH}" ]; then
+        SRC="\${AUGUSTUS_CONFIG_PATH}"
+    fi
+    if [ -z "\$SRC" ] && command -v augustus >/dev/null 2>&1; then
+        cand="\$(dirname "\$(command -v augustus)")/../config"
+        [ -d "\$cand" ] && SRC="\$(readlink -f "\$cand")"
+    fi
+    if [ -z "\$SRC" ] || [ ! -d "\$SRC" ]; then
+        echo "[ERROR] Could not locate an installed augustus config to copy." >&2
+        echo "        Set AUGUSTUS_CONFIG_PATH in the provisioning environment, ensure 'augustus' is on PATH," >&2
+        echo "        or pass --augustus_config_source /path/to/augustus/config." >&2
+        exit 1
+    fi
+
+    echo "[INFO] Seeding writable augustus config at ${cfg_dir} from \$SRC"
+    mkdir -p ${cfg_dir}
+    cp -a "\$SRC/." ${cfg_dir}/
+    echo "[INFO] augustus config ready at ${cfg_dir}"
+    """
+
+    stub:
+    cfg_dir = file(params.augustus_config).name
+    """
+    mkdir -p ${cfg_dir}/species
+    echo "[STUB] SETUP_AUGUSTUS_CONFIG at ${cfg_dir}"
     """
 }
 
@@ -1814,6 +1877,12 @@ def staleRnaseq(String out, String species) {
 }
 
 workflow {
+    // Fail fast with an actionable message when a pipeline profile was not selected
+    // (these params come from conf/profile_annotate.config). Without it, downstream
+    // file(params.funannotate_db) calls throw a cryptic "file() ... cannot be null".
+    if( !params.taxondb || !params.funannotate_db )
+        error "Missing params.taxondb / params.funannotate_db — add a pipeline profile, e.g. -profile annotate,slurm,module (or use: sbatch nextflow/run_annotate.sh)"
+
     def suppressSet = (params.suppress && file(params.suppress).exists())
         ? file(params.suppress).readLines()
               .collect { it.trim().split(',')[0].trim() }
@@ -1992,16 +2061,19 @@ workflow {
                 }
         }
 
-        // Build the funannotate database before any train/predict/annotate step uses it.
-        // storeDir makes SETUP_FUNANNOTATE_DB a no-op once params.funannotate_db exists, so
-        // on resumed runs this gate is free. Gating predict_genome_ch threads the dependency
-        // through the entire downstream funannotate subgraph (train, predict, update, annotate)
-        // via a single edge. (MASKREPEAT uses `funannotate mask`, which needs no DB, so it is
-        // intentionally left ungated and can run in parallel with the DB build.)
+        // Build the funannotate database and seed the writable augustus config before any
+        // train/predict/annotate step uses them. storeDir makes both SETUP_FUNANNOTATE_DB and
+        // SETUP_AUGUSTUS_CONFIG no-ops once their target dirs exist, so on resumed runs these
+        // gates are free. Gating predict_genome_ch threads the dependency through the entire
+        // downstream funannotate subgraph (train, predict, update, annotate) via single edges.
+        // (MASKREPEAT uses `funannotate mask`, which needs neither, so it is intentionally left
+        // ungated and can run in parallel with these setup steps.)
         SETUP_FUNANNOTATE_DB()
+        SETUP_AUGUSTUS_CONFIG()
         predict_genome_ch = predict_genome_ch
             .combine(SETUP_FUNANNOTATE_DB.out.db)
-            .map { row -> row[0..-2] }
+            .combine(SETUP_AUGUSTUS_CONFIG.out.config)
+            .map { row -> row[0..-3] }
 
         // FUNANNOTATE_PREDICT input tuple drops taxonid (not needed after masking/clean).
         // When SRA is enabled: SRA_FETCH fetches reads once per species; RNASEQ_PREPARE runs
