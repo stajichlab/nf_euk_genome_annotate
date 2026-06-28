@@ -1,0 +1,268 @@
+================================================================================
+                    nf_funannotate1 Module Structure
+================================================================================
+
+ROOT: funannotate.nf (orchestrator)
+│
+├── PHASE 1: GENOME PREPROCESSING
+│
+│   ┌──────────────────────────────────────────────────────────────┐
+│   │ modules/AAFTF/                                               │
+│   │ (Assembly Annotation & Function Transfer)                   │
+│   └──────────────────────────────────────────────────────────────┘
+│   ├── asm_stats.nf
+│   │   └── ASM_STATS (assembly statistics generation)
+│   │       Input:  samples.csv, genome_dir
+│   │       Output: asm_stats.tsv.gz
+│   │
+│   ├── FCS_GX.nf
+│   │   ├── GENOME_CLEAN_BATCH (FCS-GX path)
+│   │   │   Input:  raw genome, taxonid
+│   │   │   Output: clean genome, taxonomy report
+│   │   │
+│   │   └── FCS contamination removal
+│   │       Uses: /dev/shm staging (30 min one-time cost)
+│   │
+│   ├── sourpurge.nf
+│   │   └── Source organism contamination screening
+│   │
+│   └── vecscreen.nf
+│       └── Vector contamination screening
+│
+│   ┌──────────────────────────────────────────────────────────────┐
+│   │ modules/repeatmasking/                                       │
+│   │ (Repeat Masking Strategy Selection)                          │
+│   └──────────────────────────────────────────────────────────────┘
+│   └── masking.nf
+│       ├── NONE
+│       │   └── Skip masking (use clean genome directly)
+│       │
+│       ├── TANTAN
+│       │   ├── MASKREPEAT_TANTAN_RUN
+│       │   │   Input:  clean genome
+│       │   │   Output: tantan-masked genome
+│       │   │
+│       │   └── Fast soft-masking (current default)
+│       │
+│       ├── REPEATMODELER
+│       │   ├── De novo TE discovery
+│       │   └── Build custom library per genome
+│       │
+│       ├── REPEATMASKER
+│       │   ├── Library-based masking
+│       │   ├── Input options:
+│       │   │   ├── Existing library path
+│       │   │   └── Species name (Repbase)
+│       │   │
+│       │   └── Conservative masking
+│       │
+│       └── EARLGREY
+│           ├── De novo TE discovery + masking
+│           ├── Representative per species only
+│           ├── Curated library applied to strains
+│           │   Input:  representative genome
+│           │   Output: masked representative + member genomes
+│           │
+│           └── Currently in separate earlgrey_mask.nf pipeline
+│
+│
+├── PHASE 2: GENE PREDICTION
+│
+│   ┌──────────────────────────────────────────────────────────────┐
+│   │ modules/rnaseq_fetch/                                        │
+│   │ (RNA-seq Discovery & Preparation)                            │
+│   └──────────────────────────────────────────────────────────────┘
+│   │
+│   ├── sra_query.nf
+│   │   ├── SRA_QUERY
+│   │   │   Input:  species_tag, taxonid
+│   │   │   Output: per-species SRA accessions (CSV)
+│   │   │
+│   │   ├── SRA_QUERY_BATCH
+│   │   │   Parallel batch queries (maxForks: 4)
+│   │   │
+│   │   └── COLLECT_SRA_QUERY
+│   │       Merge all per-species CSVs into manifest
+│   │
+│   ├── sra_fetch.nf
+│   │   ├── SRA_FETCH
+│   │   │   Input:  per-species SRA accessions (CSV)
+│   │   │   Output: normalized R1/R2 FASTQ
+│   │   │   Steps:  parallel-fastq-dump → seqkit → fastp → bbnorm
+│   │   │
+│   │   ├── SRA_FETCH_SE
+│   │   │   Input:  SE accessions or mislabeled PE data
+│   │   │   Output: normalized SE FASTQ
+│   │   │
+│   │   └── WRITE_EMPTY_READS
+│   │       Create placeholders for species with no SRA
+│   │
+│   └── prepare.nf
+│       ├── RNASEQ_PREPARE
+│       │   Input:  representative genome, normalized R1/R2
+│       │   Output: shared trinity-GG.fasta per species
+│       │   Steps:  funannotate train --stop_after_trinity
+│       │
+│       └── Single assembly per species runs full training;
+│           output shared with all conspecific strains
+│
+│   ┌──────────────────────────────────────────────────────────────┐
+│   │ modules/funannotate/                                         │
+│   │ (Gene Prediction & Refinement)                               │
+│   └──────────────────────────────────────────────────────────────┘
+│   │
+│   ├── train.nf
+│   │   ├── FUNANNOTATE_TRAIN
+│   │   │   Representatives: funannotate train --stop_after_trinity
+│   │   │   Strains:        funannotate train --trinity (shared)
+│   │   │   Input:  cleaned/masked genome, reads, trinity-GG.fasta
+│   │   │   Output: training data for predict
+│   │   │
+│   │   └── PASA integration for transcript alignment
+│   │
+│   ├── predict.nf
+│   │   ├── FUNANNOTATE_PREDICT
+│   │   │   Input:  masked genome, training data
+│   │   │   Output: predict_results/gbk, proteins.fa, gff3
+│   │   │   Steps:  pre-flight validation → funannotate predict
+│   │   │
+│   │   ├── Pre-flight checks:
+│   │   │   ├── Assembly size ≥ predict_min_asm_bp
+│   │   │   ├── N50 ≥ predict_frag_max_n50
+│   │   │   └── Contigs < predict_frag_max_contigs
+│   │   │
+│   │   └── Post-flight safety:
+│   │       ├── Validate GBK produced
+│   │       ├── Catch "not enough models" early
+│   │       └── Flag too-small/fragmented assemblies
+│   │
+│   └── update.nf (Optional)
+│       ├── FUNANNOTATE_UPDATE
+│       │   Input:  predict_results/, normalized reads
+│       │   Output: updated annotations
+│       │
+│       └── Refinement step for models with transcriptomics
+│
+│
+├── PHASE 3: ANNOTATION
+│
+│   ┌──────────────────────────────────────────────────────────────┐
+│   │ modules/annotate/                                            │
+│   │ (Post-prediction Annotation)                                 │
+│   └──────────────────────────────────────────────────────────────┘
+│   │
+│   ├── annotation_tools.nf
+│   │   ├── ANTISMASH_RUN
+│   │   │   Input:  predict_results/gbk
+│   │   │   Output: antismash_local/ (JSON reports)
+│   │   │
+│   │   ├── SIGNALP_RUN
+│   │   │   Input:  predict_results/proteins.fa
+│   │   │   Output: annotate_misc/signalp.results.txt
+│   │   │
+│   │   └── INTERPROSCAN_RUN
+│   │       Input:  predict_results/proteins.fa
+│   │       Output: annotate_misc/iprscan.xml
+│   │
+│   └── funannotate.nf
+│       ├── FUNANNOTATE_ANNOTATE
+│       │   Input:  predict_results/, all optional tool outputs
+│       │   Output: annotate_results/gbk, proteins.fa, gff3
+│       │   Steps:  merge antismash/interpro/signalp → funannotate annotate
+│       │
+│       └── Final functional annotation step
+│
+│
+└── PHASE 4: SETUP & UTILITIES
+
+    ┌──────────────────────────────────────────────────────────────┐
+    │ modules/setup/                                               │
+    │ (Database Initialization)                                    │
+    └──────────────────────────────────────────────────────────────┘
+    │
+    └── databases.nf
+        ├── SETUP_TAXONDB
+        │   Purpose: Download NCBI taxonomy (for FCS-GX)
+        │   Cached:  params.taxondb (storeDir)
+        │
+        ├── SETUP_FUNANNOTATE_DB
+        │   Purpose: Build funannotate databases (BUSCO, etc.)
+        │   Cached:  params.funannotate_db (storeDir)
+        │
+        └── SETUP_AUGUSTUS_CONFIG
+            Purpose: Seed writable Augustus config
+            Cached:  params.augustus_config (storeDir)
+            Note:    Augustus writes species configs during training
+
+
+================================================================================
+                         WORKFLOW DATA FLOW
+================================================================================
+
+Raw Genomes (samples.csv + GENOME column)
+    │
+    ├─→ [PHASE 1: PREPROCESSING] ─────────┐
+    │   ├─→ CLEAN (FCS-GX/sourpurge)     │
+    │   │                                  │
+    │   ├─→ SUMMARY_STATS (ASM_STATS)    │
+    │   │   └─→ asm_stats.tsv.gz         │
+    │   │       (used by: earlgrey_mask)  │
+    │   │                                  │
+    │   └─→ MASK (strategy selector)      │
+    │       ├─→ NONE: skip                │
+    │       ├─→ TANTAN: fast              │
+    │       ├─→ REPEATMODELER            │
+    │       ├─→ REPEATMASKER             │
+    │       └─→ EARLGREY: curated        │
+    │                                      │
+    ├─→ [PHASE 2: PREDICTION] ───────────┐
+    │   ├─→ RNA-seq Branch:               │
+    │   │   ├─→ SRA_QUERY (NCBI)         │
+    │   │   ├─→ SRA_FETCH (download)     │
+    │   │   └─→ RNASEQ_PREPARE (Trinity) │
+    │   │                                  │
+    │   ├─→ TRAIN (funannotate)          │
+    │   │                                  │
+    │   └─→ PREDICT (funannotate)        │
+    │       └─→ predict_results/          │
+    │           ├─→ gbk (gene calls)      │
+    │           ├─→ proteins.fa           │
+    │           └─→ gff3 (features)       │
+    │                                      │
+    ├─→ [PHASE 3: ANNOTATION] ──────────┐
+    │   ├─→ Optional Tools (parallel):    │
+    │   │   ├─→ ANTISMASH                │
+    │   │   ├─→ SIGNALP                  │
+    │   │   └─→ INTERPROSCAN             │
+    │   │                                  │
+    │   └─→ ANNOTATE (merge results)     │
+    │       └─→ annotate_results/         │
+    │           ├─→ gbk (final)           │
+    │           ├─→ proteins.fa           │
+    │           └─→ gff3 (final)          │
+    │                                      │
+    └─→ [Final Output]
+        └─→ genome_annotation/
+            ├─→ Species1/Strain1/
+            ├─→ Species1/Strain2/
+            └─→ ...
+
+
+================================================================================
+                          CURRENT STATUS
+================================================================================
+
+✅ READY FOR PRODUCTION:
+   - modules/asm_stats.nf (will move to modules/AAFTF/)
+   - modules/annotation_tools.nf (will move to modules/annotate/)
+   - --skip_select_reps in earlgrey_mask.nf
+
+📋 AWAITING IMPLEMENTATION (in priority order):
+   1. Phase 2.1: modules/rnaseq_fetch/ (sra_query, sra_fetch, prepare)
+   2. Phase 2.2: modules/funannotate/ (train, predict, update)
+   3. Phase 1: modules/AAFTF/ (FCS_GX, sourpurge, vecscreen)
+   4. Phase 1: modules/repeatmasking/ (masking strategy selector)
+   5. Phase 3: Move modules/annotation_tools.nf to modules/annotate/
+   6. Phase 4: modules/setup/ (databases)
+
+================================================================================
