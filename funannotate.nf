@@ -1570,137 +1570,6 @@ process FUNANNOTATE_PREDICT {
     """
 }
 
-process ANTISMASH_RUN {
-    label 'antismash'
-    tag "${meta.id}"
-
-    cpus   8
-    memory '16 GB'
-    time   '60h'
-
-    publishDir "${params.target}", mode: 'copy', overwrite: true
-
-    input:
-    val(meta)
-
-    output:
-    tuple val(meta), path("${meta.id}/antismash_local/**")
-
-    script:
-    def out = meta.id
-    def gbk = "${params.target}/${out}/predict_results/${out}.gbk"
-    """
-    # Accept a compressed prediction (.gbk.gz); antismash needs it uncompressed, so
-    # inflate a local copy in the work dir when only the gzipped form is present.
-    GBK="${gbk}"
-    if [ ! -f "\$GBK" ] && [ -f "${gbk}.gz" ]; then
-        zcat "${gbk}.gz" > ${out}.predict.gbk
-        GBK=${out}.predict.gbk
-    fi
-    if [ ! -f "\$GBK" ]; then
-        echo "ERROR: predict GBK not found: ${gbk}[.gz]" >&2
-        exit 1
-    fi
-    source /etc/profile.d/modules.sh 2>/dev/null || true
-    mkdir -p ${out}/antismash_local
-    antismash --taxon ${params.antismash_taxon} \\
-        --output-dir ${out}/antismash_local \\
-        --genefinding-tool none \\
-        --fullhmmer --clusterhmmer --cb-general --pfam2go \\
-        -c ${task.cpus} \\
-        \$GBK
-    pigz ${out}/antismash_local/*.json
-    """
-
-    stub:
-    def out = meta.id
-    """
-    mkdir -p ${out}/antismash_local
-    touch ${out}/antismash_local/${out}.json.gz
-    touch ${out}/antismash_local/index.html
-    """
-}
-
-// IPRSCAN5
-process INTERPROSCAN_RUN {
-    label 'interproscan'
-    tag "${meta.id}"
-
-    cpus   8
-    memory '32 GB'
-    time   '60h'
-
-    publishDir "${params.target}", mode: 'copy', overwrite: true
-
-    input:
-    val(meta)
-
-    output:
-    tuple val(meta), path("${meta.id}/annotate_misc/iprscan.xml")
-
-    script:
-    def out      = meta.id
-    def proteins = "${params.target}/${out}/predict_results/${out}.proteins.fa"
-    """
-    if [ ! -f "${proteins}" ]; then
-        echo "ERROR: protein FASTA not found: ${proteins}" >&2
-        exit 1
-    fi
-    mkdir -p ${out}/annotate_misc
-    interproscan.sh -i ${proteins} -f XML -o ${out}/annotate_misc/iprscan.xml \\
-        -dp -goterms -pa -t p -cpu ${task.cpus}
-    """
-
-    stub:
-    def out = meta.id
-    """
-    mkdir -p ${out}/annotate_misc
-    touch ${out}/annotate_misc/iprscan.xml
-    """
-}
-
-process SIGNALP_RUN {
-    label 'signalp'
-    tag "${meta.id}"
-
-    cpus   8
-    memory '16 GB'
-    time   '12h'
-
-    publishDir "${params.target}", mode: 'copy', overwrite: true
-
-    input:
-    val(meta)
-
-    output:
-    tuple val(meta), path("${meta.id}/annotate_misc/signalp.results.txt")
-
-    script:
-    def out      = meta.id
-    def proteins = "${params.target}/${out}/predict_results/${out}.proteins.fa"
-    """
-    if [ ! -f "${proteins}" ]; then
-        echo "ERROR: protein FASTA not found: ${proteins}" >&2
-        exit 1
-    fi
-    TMPDIR=\${SCRATCH:-/tmp}
-    signalp6 -od \$TMPDIR/${out}_signalp \\
-        -org euk --mode fast -format txt \\
-        -fasta ${proteins} \\
-        --write_procs ${task.cpus} -bs 16
-    mkdir -p ${out}/annotate_misc
-    cp \$TMPDIR/${out}_signalp/prediction_results.txt ${out}/annotate_misc/signalp.results.txt
-    rm -rf \$TMPDIR/${out}_signalp
-    """
-
-    stub:
-    def out = meta.id
-    """
-    mkdir -p ${out}/annotate_misc
-    touch ${out}/annotate_misc/signalp.results.txt
-    """
-}
-
 process FUNANNOTATE_ANNOTATE {
     label 'funannotate'
     tag "${meta.id}"
@@ -1897,7 +1766,11 @@ def staleRnaseq(String out, String species) {
 }
 
 include { validateParameters; paramsSummaryLog; paramsHelp } from 'plugin/nf-schema'
-include { ASM_STATS } from './modules/asm_stats'
+include { ASM_STATS }        from './modules/local/asm_stats'
+include { INPUT_CHECK }      from './subworkflows/local/input_check'
+include { ANTISMASH_RUN }    from './modules/local/antismash_run'
+include { INTERPROSCAN_RUN } from './modules/local/interproscan_run'
+include { SIGNALP_RUN }      from './modules/local/signalp_run'
 
 workflow {
     // `--help` prints schema-driven parameter help (grouped, with types/defaults) and exits.
@@ -1916,74 +1789,13 @@ workflow {
     if( !params.taxondb || !params.funannotate_db )
         error "Missing params.taxondb / params.funannotate_db — add a pipeline profile, e.g. -profile annotate,slurm,module (or use: sbatch nextflow/run_annotate.sh)"
 
-    def suppressSet = (params.suppress && file(params.suppress).exists())
-        ? file(params.suppress).readLines()
-              .collect { it.trim().split(',')[0].trim() }
-              .findAll { it && !it.startsWith('#') }
-              .toSet()
-        : ([] as Set)
-    if (suppressSet) {
-        log.info "Suppress list loaded: ${suppressSet.size()} ASMIDs will be skipped"
-    }
-
-    // ── Taxonomy filter ───────────────────────────────────────────────────────
-    // Parse --taxon RANK:VALUE (e.g. --taxon PHYLUM:Ascomycota).
-    // taxonFilter is a closure applied after splitCsv on the raw row map.
-    def taxonFilter
-    if (params.taxon) {
-        def parts = (params.taxon as String).split(':', 2)
-        if (parts.size() != 2 || !parts[0] || !parts[1]) {
-            error "--taxon must be in RANK:VALUE format, e.g. --taxon PHYLUM:Ascomycota"
-        }
-        def taxRank  = parts[0].toUpperCase()
-        def taxValue = parts[1]
-        log.info "Taxonomy filter: ${taxRank} = '${taxValue}'"
-        taxonFilter = { row -> row[taxRank]?.trim() == taxValue }
-    } else {
-        taxonFilter = { row -> true }
-    }
-
-    // ── ASMID filter ──────────────────────────────────────────────────────────
-    def asmidFilter = params.asmid
-        ? { row -> row.ASMID?.trim() == (params.asmid as String).trim() }
-        : { row -> true }
-    if (params.asmid) {
-        log.info "ASMID filter: processing only '${params.asmid}'"
-    }
-
-    // ── Prediction pipeline ───────────────────────────────────────────────────
-    def jobs = channel.fromPath(params.samples)
-        .splitCsv(header: true)
-        .filter(taxonFilter)
-        .filter(asmidFilter)
-        .map { row ->
-            def meta = SampleUtils.makeMeta(row)
-            def genome_col = row.GENOME?.trim()
-            def gz = genome_col
-                ? (genome_col.startsWith('/') ? file(genome_col) : file("${launchDir}/${genome_col}"))
-                : file("${params.source}/${meta.asmid}/${meta.asmid}_genomic.fna.gz")
-            tuple(meta, gz)
-        }
-        .filter { meta, gz -> meta.id && meta.asmid }
-        .take((params.n_test as int) > 0 ? params.n_test as int : -1)
-        .filter { meta, gz ->
-            if (suppressSet.contains(meta.asmid)) {
-                log.info "Suppressing ${meta.id} (asmid=${meta.asmid})"
-                return false
-            }
-            return true
-        }
-        .filter { meta, gz ->
-            if (!gz.exists()) {
-                log.warn "Missing genome for ${meta.id} (asmid=${meta.asmid}): ${gz}"
-                return false
-            }
-            if (params.debug.toBoolean()) {
-                log.info "Queuing ${meta.id}: genome=${gz} (${gz.size()} bytes)"
-            }
-            return true
-        }
-
+    // ── Samplesheet ingestion (INPUT_CHECK) ──────────────────────────────────
+    // Parses samples CSV, applies taxon/asmid/suppress/n_test filters, builds
+    // meta maps, and resolves genome paths. Two outputs:
+    //   jobs        — tuple(meta, gz)  with genome existence filter (cleaning path)
+    //   postpredict — meta only        no genome filter (annotate/update paths)
+    INPUT_CHECK()
+    def jobs = INPUT_CHECK.out.genomes
     if (params.debug.toBoolean()) {
         jobs.view { meta, gz -> "[CHANNEL] Submitting: out=${meta.id}, asmid=${meta.asmid}, transl_table=${meta.transl_table}, gz=${gz}" }
     }
@@ -2328,14 +2140,9 @@ workflow {
         // postpredict: all samples with a completed predict_results/*.gbk, whether
         // produced in this run or a prior one. This is the source for all optional
         // pre-annotate steps and for FUNANNOTATE_ANNOTATE itself.
-        def postpredict = channel.fromPath(params.samples)
-            .splitCsv(header: true)
-            .filter(taxonFilter)
-            .filter(asmidFilter)
-            .map { row -> SampleUtils.makeMeta(row) }
-            .filter { meta -> meta.id && meta.asmid }
-            .take((params.n_test as int) > 0 ? params.n_test as int : -1)
-            .filter { meta -> !suppressSet.contains(meta.asmid) }
+        // INPUT_CHECK.out.samples already has taxon/asmid/suppress/n_test filters applied;
+        // we just add the predict-results existence check on top.
+        def postpredict = INPUT_CHECK.out.samples
             // Only genomes whose prediction was already complete AND current in a PRIOR run.
             // This is the exact logical complement of the predict_ch filter, so this set is
             // disjoint from the genomes (re)predicted in THIS run (which arrive via

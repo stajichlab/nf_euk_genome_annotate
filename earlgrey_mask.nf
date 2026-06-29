@@ -56,7 +56,8 @@ def genomeFile(String base) {
 // INCLUDES
 // ════════════════════════════════════════════════════════════════════════════
 
-include { ASM_STATS } from './modules/asm_stats'
+include { ASM_STATS }   from './modules/local/asm_stats'
+include { INPUT_CHECK } from './subworkflows/local/input_check'
 
 // ════════════════════════════════════════════════════════════════════════════
 // PROCESSES
@@ -319,19 +320,15 @@ workflow {
     // without the size/N50 filtering applied by SELECT_REPS.
     def reps
     if (params.skip_select_reps.toBoolean()) {
-        log.info "Skipping SELECT_REPS; processing all genomes for EarlGrey"
-        reps = channel.fromPath(params.samples, glob: false)
-            .splitCsv(header: true)
-            .map { row ->
-                def species = (row.SPECIES?.trim() ?: '')
-                def asmid = (row.ASMID?.trim() ?: '')
-                if (species && asmid) {
-                    "SPECIES,REP_ASMID,REP_SIZE_MB,N_MEMBERS,MEMBER_ASMIDS\n${species},${asmid},0.0,0,"
-                } else {
-                    null
-                }
+        // INPUT_CHECK applies the same taxon/asmid/suppress/n_test filters as funannotate.nf.
+        // We use samples (meta-only, no genome-existence check) because EarlGrey reads genomes
+        // from input_clean_genomes/, not from the raw params.source path.
+        log.info "Skipping SELECT_REPS; processing all filtered genomes for EarlGrey"
+        INPUT_CHECK()
+        reps = INPUT_CHECK.out.samples
+            .map { meta ->
+                "SPECIES,REP_ASMID,REP_SIZE_MB,N_MEMBERS,MEMBER_ASMIDS\n${meta.species},${meta.asmid},0.0,0,"
             }
-            .filter { it != null }
             .collectFile(name: "${launchDir}/misc/repeat_representatives.csv", newLine: false)
     } else {
         reps = SELECT_REPS(
