@@ -109,7 +109,7 @@
         "genome_cleaning_masking": {
             "title": "Genome cleaning & masking",
             "type": "object",
-            "description": "Assembly length-filter, FCS-GX contaminant purge, and repeat masking.",
+            "description": "Assembly length-filter, FCS-GX contaminant purge, repeat masking, and TE library construction.",
             "properties": {
                 "min_contig_len": {
                     "type": "integer",
@@ -138,15 +138,65 @@
                     "description": "Batch this many genomes into one GENOME_CLEAN_BATCH job (stages FCS-GX db once). 0 (or skip_fcs) = one job per genome.",
                     "default": 1000
                 },
+                "genome_dir": {
+                    "type": "string",
+                    "description": "Directory containing cleaned genome FASTAs (written by GENOME_CLEAN, read by ASM_STATS and earlgrey_mask.nf).",
+                    "default": "${launchDir}/input_clean_genomes"
+                },
                 "run_repeatmasker": {
                     "type": "boolean",
-                    "description": "Run repeat masking (tantan) before prediction.",
+                    "description": "Run tantan soft-masking before prediction.",
                     "default": true
+                },
+                "run_earlgrey": {
+                    "type": "boolean",
+                    "description": "Use EarlGrey TE-discovery masking instead of tantan. Builds a curated TE library per species, then applies it with RepeatMasker to every conspecific assembly.",
+                    "default": false
+                },
+                "earlgrey_outdir": {
+                    "type": "string",
+                    "description": "Directory for EarlGrey TE libraries and masked outputs (storeDir-cached per species).",
+                    "default": "${launchDir}/results/repeatlibrary"
+                },
+                "earlgrey_workdir": {
+                    "type": "string",
+                    "description": "Scratch directory for EarlGrey intermediate files.",
+                    "default": "${launchDir}/work/earlgrey_persist"
+                },
+                "earlgrey_version": {
+                    "type": "string",
+                    "description": "EarlGrey module version to load (UCR HPCC Lmod; ignored under other provisioning profiles).",
+                    "default": "7.2.6"
+                },
+                "repeatmasker_version": {
+                    "type": "string",
+                    "description": "RepeatMasker module version to load for per-strain masking (UCR HPCC Lmod).",
+                    "default": "4.1.8"
+                },
+                "repeat_taxon": {
+                    "type": "string",
+                    "description": "Taxonomic group passed to EarlGrey -r (e.g. fungi, insects, vertebrates).",
+                    "default": "fungi"
+                },
+                "masked_dir": {
+                    "type": "string",
+                    "description": "Destination for DELIVER_MASK output (finished masked FASTAs read by funannotate predict).",
+                    "default": "${launchDir}/input_clean_genomes"
                 },
                 "only_clean": {
                     "type": "boolean",
                     "description": "Stop after genome cleaning (no masking/prediction).",
                     "default": false
+                },
+                "gen_asm_stats": {
+                    "type": "boolean",
+                    "description": "Generate asm_stats.tsv.gz from cleaned genomes (used by earlgrey_mask.nf SELECT_REPS to pick the most contiguous representative per species).",
+                    "default": true
+                },
+                "tables_dir": {
+                    "type": "string",
+                    "description": "Directory where asm_stats.tsv.gz is written and read.",
+                    "default": "${launchDir}/tables"
                 }
             }
         },

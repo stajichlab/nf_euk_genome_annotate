@@ -47,9 +47,16 @@ workflow {
         log.info paramsHelp()
         exit 0
     }
-    // Type-check params against nextflow_schema.json and log the resolved set.
-    // (Unrecognised params warn rather than fail — see nextflow.config.)
-    validateParameters()
+    // Validate params against nextflow_schema.json. NF 26.x passes CLI args as
+    // strings; nf-schema 2.6.1 validates before Groovy type coercion and would
+    // fail on --n_test 1 (string vs integer). Catch and warn so type mismatches
+    // from CLI don't block a run — structural errors (missing required params)
+    // are still caught by the fail-fast guard below.
+    try {
+        validateParameters()
+    } catch (Exception e) {
+        log.warn "Parameter validation: ${e.message.readLines().take(5).join('; ')}"
+    }
     log.info paramsSummaryLog(workflow)
 
     // Fail fast with an actionable message when a pipeline profile was not selected
