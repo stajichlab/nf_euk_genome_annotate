@@ -1,18 +1,14 @@
 process SIGNALP_RUN {
     label 'signalp'
+    label 'process_medium'
     tag "${meta.id}"
-
-    cpus   8
-    memory '16 GB'
-    time   '12h'
-
-    publishDir "${params.target}", mode: 'copy', overwrite: true
 
     input:
     val(meta)
 
     output:
-    tuple val(meta), path("${meta.id}/annotate_misc/signalp.results.txt")
+    tuple val(meta), path("${meta.id}/annotate_misc/signalp.results.txt"), emit: results
+    path 'versions.yml',                                                    emit: versions
 
     script:
     def out      = meta.id
@@ -30,6 +26,11 @@ process SIGNALP_RUN {
     mkdir -p ${out}/annotate_misc
     cp \$TMPDIR/${out}_signalp/prediction_results.txt ${out}/annotate_misc/signalp.results.txt
     rm -rf \$TMPDIR/${out}_signalp
+
+    cat <<-END_VERSIONS > versions.yml
+    "${task.process}":
+        signalp: \$(signalp6 --version 2>&1 | grep -oP '\\d+\\.\\d+\\S*' | head -1)
+    END_VERSIONS
     """
 
     stub:
@@ -37,5 +38,9 @@ process SIGNALP_RUN {
     """
     mkdir -p ${out}/annotate_misc
     touch ${out}/annotate_misc/signalp.results.txt
+    cat <<-END_VERSIONS > versions.yml
+    "${task.process}":
+        signalp: 6.0g
+    END_VERSIONS
     """
 }

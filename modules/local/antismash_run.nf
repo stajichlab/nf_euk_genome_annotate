@@ -1,25 +1,19 @@
 process ANTISMASH_RUN {
     label 'antismash'
+    label 'process_medium'
     tag "${meta.id}"
-
-    cpus   8
-    memory '16 GB'
-    time   '60h'
-
-    publishDir "${params.target}", mode: 'copy', overwrite: true
 
     input:
     val(meta)
 
     output:
-    tuple val(meta), path("${meta.id}/antismash_local/**")
+    tuple val(meta), path("${meta.id}/antismash_local/**"), emit: results
+    path 'versions.yml',                                    emit: versions
 
     script:
     def out = meta.id
     def gbk = "${params.target}/${out}/predict_results/${out}.gbk"
     """
-    # Accept a compressed prediction (.gbk.gz); antismash needs it uncompressed, so
-    # inflate a local copy in the work dir when only the gzipped form is present.
     GBK="${gbk}"
     if [ ! -f "\$GBK" ] && [ -f "${gbk}.gz" ]; then
         zcat "${gbk}.gz" > ${out}.predict.gbk
@@ -38,6 +32,11 @@ process ANTISMASH_RUN {
         -c ${task.cpus} \\
         \$GBK
     pigz ${out}/antismash_local/*.json
+
+    cat <<-END_VERSIONS > versions.yml
+    "${task.process}":
+        antismash: \$(antismash --version 2>&1 | grep -oP '(?<=antiSMASH )\\S+' || antismash --version 2>&1 | head -1)
+    END_VERSIONS
     """
 
     stub:
@@ -46,5 +45,9 @@ process ANTISMASH_RUN {
     mkdir -p ${out}/antismash_local
     touch ${out}/antismash_local/${out}.json.gz
     touch ${out}/antismash_local/index.html
+    cat <<-END_VERSIONS > versions.yml
+    "${task.process}":
+        antismash: 7.1.0
+    END_VERSIONS
     """
 }

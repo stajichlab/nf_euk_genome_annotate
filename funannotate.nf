@@ -1796,6 +1796,8 @@ workflow {
     //   postpredict — meta only        no genome filter (annotate/update paths)
     INPUT_CHECK()
     def jobs = INPUT_CHECK.out.genomes
+
+    def ch_versions = Channel.empty()
     if (params.debug.toBoolean()) {
         jobs.view { meta, gz -> "[CHANNEL] Submitting: out=${meta.id}, asmid=${meta.asmid}, transl_table=${meta.transl_table}, gz=${gz}" }
     }
@@ -1875,6 +1877,7 @@ workflow {
                     file(params.samples),
                     file(params.genome_dir)
                 )
+                ch_versions = ch_versions.mix(ASM_STATS.out.versions)
             } else {
                 log.info "Assembly statistics already exist: ${asm_stats_gz}"
             }
@@ -2178,7 +2181,8 @@ workflow {
                 asDir.isDirectory() && asDir.list()?.any { it.endsWith('.json') || it.endsWith('.json.gz') }
             }
             ANTISMASH_RUN(as_todo)
-            def as_completed = ANTISMASH_RUN.out
+            ch_versions = ch_versions.mix(ANTISMASH_RUN.out.versions)
+            def as_completed = ANTISMASH_RUN.out.results
                 .map { meta, _files -> meta }
             annotate_ready_ch = as_completed.mix(as_done)
         }
@@ -2191,7 +2195,8 @@ workflow {
                 file("${params.target}/${meta.id}/annotate_misc/iprscan.xml").exists()
             }
             INTERPROSCAN_RUN(ipr_todo)
-            def ipr_completed = INTERPROSCAN_RUN.out
+            ch_versions = ch_versions.mix(INTERPROSCAN_RUN.out.versions)
+            def ipr_completed = INTERPROSCAN_RUN.out.results
                 .map { meta, _xml -> meta }
             annotate_ready_ch = ipr_completed.mix(ipr_done)
         }
@@ -2204,7 +2209,8 @@ workflow {
                 file("${params.target}/${meta.id}/annotate_misc/signalp.results.txt").exists()
             }
             SIGNALP_RUN(sp_todo)
-            def sp_completed = SIGNALP_RUN.out
+            ch_versions = ch_versions.mix(SIGNALP_RUN.out.versions)
+            def sp_completed = SIGNALP_RUN.out.results
                 .map { meta, _txt -> meta }
             annotate_ready_ch = sp_completed.mix(sp_done)
         }
@@ -2251,5 +2257,15 @@ workflow {
         }
         } // end if (!params.stop_after_sra_fetch || !params.run_sra_fetch)
     }
+
+    // Collect software versions from all processes that emit versions.yml.
+    // Written to logs/software_versions.yml alongside the trace file.
+    ch_versions
+        .unique()
+        .collectFile(
+            name:     'software_versions.yml',
+            storeDir: "${launchDir}/logs/nextflow",
+            newLine:  true
+        )
 }
 

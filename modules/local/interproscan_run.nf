@@ -1,19 +1,14 @@
-// IPRSCAN5
 process INTERPROSCAN_RUN {
     label 'interproscan'
+    label 'process_medium'
     tag "${meta.id}"
-
-    cpus   8
-    memory '32 GB'
-    time   '60h'
-
-    publishDir "${params.target}", mode: 'copy', overwrite: true
 
     input:
     val(meta)
 
     output:
-    tuple val(meta), path("${meta.id}/annotate_misc/iprscan.xml")
+    tuple val(meta), path("${meta.id}/annotate_misc/iprscan.xml"), emit: results
+    path 'versions.yml',                                            emit: versions
 
     script:
     def out      = meta.id
@@ -26,6 +21,11 @@ process INTERPROSCAN_RUN {
     mkdir -p ${out}/annotate_misc
     interproscan.sh -i ${proteins} -f XML -o ${out}/annotate_misc/iprscan.xml \\
         -dp -goterms -pa -t p -cpu ${task.cpus}
+
+    cat <<-END_VERSIONS > versions.yml
+    "${task.process}":
+        interproscan: \$(interproscan.sh --version 2>&1 | grep -oP '\\d+\\.\\d+\\.\\d+' | head -1)
+    END_VERSIONS
     """
 
     stub:
@@ -33,5 +33,9 @@ process INTERPROSCAN_RUN {
     """
     mkdir -p ${out}/annotate_misc
     touch ${out}/annotate_misc/iprscan.xml
+    cat <<-END_VERSIONS > versions.yml
+    "${task.process}":
+        interproscan: 5.65-97.0
+    END_VERSIONS
     """
 }
