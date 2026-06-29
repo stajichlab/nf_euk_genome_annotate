@@ -1,171 +1,228 @@
-# Nextflow Pipeline Modularization Plan
+# nf_funannotate1 — Modularization Plan (authoritative)
 
-## Pipeline Workflow Structure
+> This is the **single source of truth** for the DSL2 modularization effort. It
+> supersedes the earlier `IMPLEMENTATION_SUMMARY.md` and `MODULE_STRUCTURE.txt`
+> (removed). Progress is tracked in GitHub issues — see
+> `.github/REFACTOR_ISSUES.md` and `scripts/create_refactor_issues.sh`.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    GENOME PREPROCESSING                          │
-├─────────────────────────────────────────────────────────────────┤
-│  CLEAN              │ MASK                  │ SUMMARY_STATS     │
-│  ─────              │ ────                  │ ─────────────     │
-│  • FCS_GX           │ • NONE                │ • ASM_STATS       │
-│  • sourpurge        │ • TANTAN              │                   │
-│  • vecscreen        │ • REPEATMODELER       │                   │
-│                     │ • REPEATMASKER        │                   │
-│                     │ • EARLGREY            │                   │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                    GENE PREDICTION                               │
-├──────────────────────────────────┬──────────────────────────────┤
-│   RNA-seq Preparation             │  Funannotate Pipeline       │
-│   ─────────────────────           │  ──────────────────        │
-│   • SRA_QUERY                     │  • TRAIN                   │
-│   • SRA_FETCH (PE & SE)           │  • PREDICT                 │
-│   • RNASEQ_PREPARE (Trinity)      │  • UPDATE (optional)       │
-└──────────────────────────────────┴──────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                    ANNOTATION                                    │
-├─────────────────────────────────────────────────────────────────┤
-│  • ANTISMASH (secondary metabolites)                            │
-│  • SIGNALP (signal peptides)                                    │
-│  • INTERPROSCAN (protein domains - when implemented)            │
-│  • FUNANNOTATE_ANNOTATE (final annotation)                      │
-└─────────────────────────────────────────────────────────────────┘
+## Where we actually are
+
+- `funannotate.nf`: **2,470-line monolith, 20 inline processes.**
+- `earlgrey_mask.nf`: separate 394-line pipeline that **duplicates** the
+  samplesheet parse + taxonomy/asmid/suppress filtering from `funannotate.nf`.
+- Extracted so far: `modules/asm_stats.nf`, `modules/annotation_tools.nf` (2 of 20).
+- Strong base already present: nf-schema + `nextflow_schema.json`, orthogonal
+  profiles, manifest, CITATIONS/COC/CHANGELOG/LICENSE, stub-run CI.
+
+The goal is an **nf-core-*inspired*** layout (not nf-core submission): adopt the
+parts that are pure engineering wins, skip the parts that fight our HPC reality.
+
+---
+
+## Principle 0 — the data contract (do this FIRST; blocks everything else)
+
+Every process is currently wired with a fragile positional 10-tuple:
+
+```groovy
+tuple(out, asmid, species, strain, locustag, busco, header_length, transl_table, gz, taxonid)
 ```
 
-## Completed ✅
-✅ **ASM_STATS Module** (`modules/asm_stats.nf`)
-- Extracted assembly statistics generation into a separate reusable module
-- Used by both `funannotate.nf` and `earlgrey_mask.nf`
-- Generates `asm_stats.tsv.gz` with ASMID, total_length_bp, N50_bp, contig_count
+Adding an 11th field touches every process. **Replace it with a `meta` map**, the
+standard DSL2 idiom. Genome travels as a separate `path`:
 
-✅ **Optional SELECT_REPS** (`earlgrey_mask.nf`)
-- Added `--skip_select_reps` flag to skip representative selection
-- When enabled, all genomes are processed for EarlGrey masking without size filtering
-- Added `--gen_asm_stats` flag (default: true) to auto-generate assembly statistics
+```groovy
+// Canonical channel element: tuple val(meta), path(genome)
+meta = [
+    id          : out,          // unique sample tag — used for tag{} and file naming
+    asmid       : asmid,
+    species     : species,
+    strain      : strain,
+    locustag    : locustag,
+    busco       : busco,        // BUSCO_LINEAGE
+    transl_table: transl_table, // default '1'
+    taxonid     : taxonid,
+]
+```
 
-✅ **Annotation Tools Module** (`modules/annotation_tools.nf`)
-- ANTISMASH_RUN (secondary metabolite detection)
-- INTERPROSCAN_RUN (protein domain annotation)
-- SIGNALP_RUN (signal peptide prediction)
+Rules:
+- `meta.id` is the **only** field used for naming/`tag`; everything else is payload.
+- `header_length` (constant 24) becomes `params.header_length`, **not** a meta field.
+- Build `meta` once, in the `INPUT_CHECK` subworkflow (below). No process
+  re-parses the samplesheet.
+- A module's `input:` declares `tuple val(meta), val(genome)` (genome is an
+  absolute-path **string**, kept as `val` so the networked FS isn't re-staged)
+  and never positionally unpacks fields it doesn't use.
 
-## Proposed Modularization Structure (User-Approved)
+Until `meta` is adopted, **do not extract more modules** — every module written
+against the old tuple is rework.
 
-### Phase 1: Genome Preprocessing Modules
+### Groundwork landed (this is the only safe sub-step)
 
-#### `modules/AAFTF/asm_stats.nf` (Refactor existing)
-**Summary Statistics Generation**
-- ASM_STATS: Compute assembly stats (total_length_bp, N50_bp, contig_count)
-- *Note: Move existing `modules/asm_stats.nf` here*
+- `SampleUtils.makeMeta(row)` (`lib/SampleUtils.groovy`) is the **single
+  authoritative definition** of `meta`, reproducing the current `jobs`-channel
+  cleaning field-for-field so wiring it in is behaviour-preserving. Not yet called.
+- `params.header_length` (default 24) added to `nextflow.config` + schema. Still
+  threaded through the tuple for now; the conversion removes it from the tuple.
 
-#### `modules/AAFTF/FCS_GX.nf` (Extract from GENOME_CLEAN)
-**Contamination Screening & Removal**
-- FCS_GX contamination detection and removal
-- Phylum-aware filtering using NCBI taxonomy
+### Conversion recipe (the atomic change, not yet done)
 
-#### `modules/AAFTF/sourpurge.nf` (Extract from GENOME_CLEAN)
-**Sourpurge Contamination Detection**
-- Source organism contamination screening
+The rest of #3 is **atomic** — source channel, ~40 workflow channel ops, and all
+10 carrying processes move together. Recipe:
 
-#### `modules/AAFTF/vecscreen.nf` (New)
-**Vector Contamination Screening**
-- NCBI VecScreen vector contamination detection
+1. **Source channels** (`jobs` and `postpredict` maps): replace the per-field
+   `def`s with `def meta = SampleUtils.makeMeta(row)` and emit `tuple(meta, gz)`
+   (jobs) / `meta` (postpredict). `header_length` comes from `params`.
+2. **Processes** (shim to keep script bodies intact): change `input:`/`output:`
+   tuples to `tuple val(meta), val(genome)` (+ reads paths where present), add
+   `tag "${meta.id}"`, and at the top of `script:` add the alias block
+   `def out = meta.id; def asmid = meta.asmid; def species = meta.species; …`
+   so every existing `${out}`/`${asmid}` interpolation still resolves.
+3. **Workflow ops** — translate the position-coupled patterns:
+   - `.map { out, asmid, … -> tuple(out, asmid, …) }` re-threads → `.map { meta, genome -> … }`
+   - index access: `it[8].exists()` (genome) → `genome.exists()`; reads
+     `it[10]/it[12]` → name them in the destructure.
+   - slice sentinels: `row[0..8]` / `row[0..-3]` (drop combine/gate tails) →
+     destructure `(meta, genome, _sentinel)` explicitly.
+   - species-keyed `groupTuple`/`combine`/`join` for RNA-seq → key on
+     `meta.species` (compute `species_tag` from `meta.species`), carry `meta`.
+   - the reduced 8-tuple in the annotate phase collapses to a single `meta`.
+4. **Validate**: `‑profile test ‑stub-run` **and** `‑profile test ‑stub-run
+   --run_sra_fetch true` (the default stub skips the RNA-seq subgraph). Stub
+   proves graph wiring only — a real-data HPCC run confirms semantics (grouping
+   picks the right representative, reads join to the right strain).
 
-#### `modules/repeatmasking/masking.nf`
-**Repeat Masking Strategy Selection**
-- TANTAN: Soft masking (tantan algorithm)
-- REPEATMODELER: De novo TE discovery
-- REPEATMASKER: Library-based masking (existing library or species)
-- EARLGREY: De novo TE discovery + masking (currently in separate earlgrey_mask.nf)
-- NONE: Skip repeat masking entirely
+---
 
-### Phase 2: Gene Prediction Modules
+## Target architecture
 
-#### `modules/rnaseq_fetch/sra_query.nf`
-**SRA Discovery & Query**
-- SRA_QUERY: Query NCBI SRA for RNA-seq accessions per species
-- SRA_QUERY_BATCH: Batched SRA queries to NCBI
-- COLLECT_SRA_QUERY: Merge per-species results into manifest
+```
+main.nf                              # thin entrypoint: parse args, call workflow
+workflows/
+    funannotate.nf                   # wires the subworkflows (was the monolith)
+    earlgrey.nf                      # curated-mask entry, reuses shared subworkflows
+subworkflows/local/
+    input_check.nf                   # samplesheet -> meta channel + taxon/asmid/suppress filters  (SHARED)
+    setup_dbs.nf                     # SETUP_TAXONDB / FUNANNOTATE_DB / AUGUSTUS_CONFIG gating
+    prepare_genome.nf                # clean -> asm_stats -> mask
+    mask.nf                          # selects ONE masker module by params.mask_tool
+    rnaseq.nf                        # sra_query -> sra_fetch(_se) -> rnaseq_prepare
+    predict.nf                       # train -> predict -> (update)
+    annotate.nf                      # antismash|signalp|interpro -> funannotate annotate
+modules/local/                       # ONE process per file
+    setup_taxondb.nf  setup_funannotate_db.nf  setup_augustus_config.nf
+    genome_clean.nf   genome_clean_batch.nf    asm_stats.nf
+    mask_tantan.nf    mask_repeatmodeler.nf    mask_repeatmasker.nf  mask_earlgrey.nf
+    sra_query.nf      sra_query_batch.nf       collect_sra_query.nf  write_empty_reads.nf
+    sra_fetch.nf      sra_fetch_se.nf          rnaseq_prepare.nf
+    funannotate_train.nf  funannotate_predict.nf  funannotate_update.nf
+    antismash.nf      interproscan.nf          signalp.nf            funannotate_annotate.nf
+    select_reps.nf                   # earlgrey representative selection
+conf/
+    base.config                      # resources by label (process_low/medium/high/...)
+    modules.config                   # per-process publishDir + ext.args (nf-core idiom)
+```
 
-#### `modules/rnaseq_fetch/sra_fetch.nf`
-**RNA-seq Download & Normalization**
-- SRA_FETCH: Download paired-end RNA-seq, normalize reads
-- SRA_FETCH_SE: Download single-end RNA-seq, normalize
-- WRITE_EMPTY_READS: Create placeholders for species with no SRA data
+### Why this and not the old plan
 
-#### `modules/rnaseq_fetch/prepare.nf`
-**RNA-seq Assembly & Preparation**
-- RNASEQ_PREPARE: Trinity assembly and normalization per species
-- Output shared Trinity-GG for all strains of a species
+- **One tool = one process = one module file.** The old plan bundled 3 processes
+  per file (`sra_query.nf`, `annotation_tools.nf`, `databases.nf`). That is the
+  *opposite* of the convention and kills reuse. Group sequences with
+  **subworkflows**, which the old plan never mentioned.
+- **Masking is a subworkflow, not a mega-process.** A single process with an
+  `if/else` over NONE/TANTAN/REPEATMODELER/REPEATMASKER/EARLGREY is an
+  anti-pattern. Each masker is its own module; the *selection* lives in
+  `subworkflows/local/mask.nf`.
+- **Kill the funannotate/earlgrey duplication.** Both entrypoints parse the same
+  samplesheet and apply the same filters. Extract that into `input_check.nf` once
+  and call it from both. EarlGrey is a whole pipeline (SELECT_REPS + asm_stats +
+  representative-per-species), not a masking flavor — it reuses shared
+  subworkflows rather than being folded into one module.
 
-#### `modules/funannotate/train.nf`
-**Gene Model Training**
-- FUNANNOTATE_TRAIN: PASA-based training on representative assembly
-- Full training (Trinity + HISAT2 + trimmomatic) for representatives
-- PASA-only for non-representative strains
+---
 
-#### `modules/funannotate/predict.nf`
-**Gene Prediction**
-- FUNANNOTATE_PREDICT: Ab initio and evidence-based gene prediction
-- Pre-flight validation (assembly size/fragmentation checks)
-- Post-prediction filtering and formatting
+## Per-process extraction checklist (the stub-run gate)
 
-#### `modules/funannotate/update.nf` (Optional)
-**Prediction Update with RNA-seq**
-- FUNANNOTATE_UPDATE: Update predictions with mapped RNA-seq reads
-- Optional step for models with available transcriptomics data
+Apply to **one process per commit/PR**. The monolith must stay runnable at every
+commit.
 
-### Phase 3: Annotation Modules
+For process `P`:
 
-#### `modules/annotate/annotation_tools.nf` (Refactor existing)
-**Post-prediction Annotation Tools**
-- ANTISMASH_RUN: Secondary metabolite cluster detection
-- SIGNALP_RUN: Signal peptide prediction
-- INTERPROSCAN_RUN: Protein domain annotation (when implemented)
+- [ ] Create `modules/local/<p>.nf` with `process P { ... }`.
+- [ ] `input:` uses `tuple val(meta), path(...)` (no positional field unpacking).
+- [ ] Add `tag "${meta.id}"` and a resource `label` (`process_low|medium|high`).
+- [ ] Keep the existing `stub:` block; keep `storeDir`/`publishDir` behavior.
+- [ ] Emit a version: `path "versions.yml", emit: versions` + a `cat <<-END_VERSIONS`
+      block capturing the tool version. (Foundational — see Issue 3.)
+- [ ] Move the process's resource/`withName` block out of
+      `conf/profile_annotate.config` into `conf/modules.config` (name unchanged,
+      so existing `withName:` selectors keep matching).
+- [ ] In the workflow, replace the inline `process P {}` with
+      `include { P } from '../modules/local/p'` and adapt the call site to pass `meta`.
+- [ ] **Gate (must pass before commit):**
+      ```
+      nextflow config .  -profile test
+      nextflow run    .  -profile test -stub-run
+      nextflow run    .  --help
+      ```
+- [ ] Commit. One process. Repeat.
 
-#### `modules/annotate/funannotate.nf`
-**Final Funannotate Annotation**
-- FUNANNOTATE_ANNOTATE: Functional annotation merging
+---
 
-### Phase 4: Setup & Utilities
+## Migration order (corrected)
 
-#### `modules/setup/databases.nf`
-**Database Initialization**
-- SETUP_TAXONDB: NCBI taxonomy database (for FCS-GX)
-- SETUP_FUNANNOTATE_DB: Funannotate databases (BUSCO, etc.)
-- SETUP_AUGUSTUS_CONFIG: Writable Augustus configuration
+The old plan started with RNA-seq fetch ("least interdependent") — but
+`SRA_FETCH` is the **single most complex** process (~270 lines). Prove the
+pattern on a leaf first, then attack the hard pieces.
 
-## Benefits of Modularization
+| Phase | Work | Why here |
+|------|------|----------|
+| 0 | `meta` map contract + `INPUT_CHECK` subworkflow | Blocks all extraction; dedupes earlgrey |
+| 1 | Skeleton: `main.nf`, `workflows/`, `subworkflows/local/`, `modules/local/`; move existing `asm_stats` + `annotation_tools` to convention | Establishes layout cheaply |
+| 2 | `versions.yml` + `conf/base.config` + `conf/modules.config` | Pattern every later module copies |
+| 3 | Setup modules (3 leaf processes) | Easiest real extraction; validates gate |
+| 4 | Genome clean + `prepare_genome` subworkflow | Preserve FCS-GX `/dev/shm` staging |
+| 5 | `mask` subworkflow + per-tool masker modules | Replaces the mega-process design |
+| 6 | `rnaseq` subworkflow (the hard one) | Done *after* pattern is proven |
+| 7 | `predict` subworkflow (train/predict/update) | Core |
+| 8 | `annotate` subworkflow | Composition of optional tools |
+| 9 | nf-core hygiene (docs/usage, docs/output, schema_input, naming, MultiQC) | Stretch |
 
-1. **Reusability**: Modules can be composed into different pipelines
-2. **Flexibility**: Easy to swap masking strategies or annotation tools
-3. **Maintainability**: Smaller, focused files are easier to understand and modify
-4. **Testing**: Individual modules can be tested in isolation
-5. **Documentation**: Each module documents its inputs, outputs, and dependencies
-6. **Scalability**: Easier to add new tools (e.g., new masking strategies)
-7. **Git History**: Smaller commits with clear intent
+---
 
-## Implementation Strategy
+## Provisioning repivot (done)
 
-### Priority Order
-1. **Phase 2.1 (RNA-seq Fetch)**: Least interdependent, high reusability
-2. **Phase 2.2 (Funannotate Modules)**: Core prediction pipeline
-3. **Phase 1 (Genome Preprocessing)**: More complex due to conditional branching
-4. **Phase 3 (Annotation)**: Depends on Phase 2 completion
-5. **Phase 4 (Setup)**: Last, as foundational
+The `module` provisioning profile is renamed to **`ucr_hpcc`** — an
+*institutional* profile in the nf-core/configs sense. The Lmod module names and
+`/bigdata` paths only exist at UCR, so the name now says so. Portable runs use
+`singularity` (containers) or `pixi`. New sites copy
+`conf/provision_ucr_hpcc.config` to `conf/provision_<site>.config` and register a
+matching profile.
 
-### Implementation Notes
-- Each module should be standalone with clear input/output contracts
-- Use `include` statements in main workflow files
-- Maintain backward compatibility with existing wrapper scripts
-- Update nextflow.config to support module-specific params
-- Create detailed header comments in each module file
-- Use consistent naming conventions: `modules/{category}/{function}.nf`
+```
+-profile annotate,slurm,ucr_hpcc      # institutional (default on UCR HPCC)
+-profile annotate,local,singularity   # portable
+```
 
-### Testing & Validation
-- Test each module in isolation with stub runs: `-stub-run`
-- Verify module reuse works across different pipelines
-- Document module interdependencies
-- Create example usage in comments
+Issue 11 covers the fuller consolidation (folding UCR SLURM partitions /
+`clusterOptions` into the same institutional profile).
+
+---
+
+## Distance from nf-core
+
+| Area | State |
+|------|-------|
+| Scaffolding (schema, CITATIONS, COC, CHANGELOG, LICENSE, CI) | ~30–40% there |
+| `meta` map | none (Phase 0) |
+| Structure (`main.nf`/`workflows`/`subworkflows`/`modules`) | monolith |
+| `versions.yml` per module + MultiQC | none (mandatory for nf-core) |
+| Containers per module | **biggest gap** — relies on Lmod/pixi; nf-core needs conda+biocontainer per process |
+| Naming | `nf_funannotate1` violates nf-core naming (underscores/digits) |
+| nf-test, `docs/usage.md`+`output.md`, `assets/schema_input.json`, `.nf-core.yml` | missing |
+
+**Verdict:** ~30–40% on peripheral scaffolding, ~0% on the two load-bearing items
+(meta-maps + container-per-module). Full `nf-core lint` compliance is a multi-week
+rewrite, much of which fights our HPC reality. **Recommendation: nf-core-inspired,
+not nf-core-submitted** — adopt meta-maps, one-tool-per-module, subworkflows,
+`versions.yml`, `conf/modules.config`; keep `ucr_hpcc` as an institutional profile
+but add a real container path so the pipeline is portable.
