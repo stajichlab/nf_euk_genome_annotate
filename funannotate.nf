@@ -13,30 +13,25 @@
  *       -profile annotate,slurm,ucr_hpcc -resume
  */
 
-// Metadata tuple order used throughout:
-//   val(out), val(asmid), val(species), val(strain), val(locustag),
-//   val(busco_lineage), val(header_length), val(transl_table)
-// GENOME_CLEAN receives: ..., path(genome_gz), val(taxonid), val(taxondb)
-//   → emits: ..., path(genome_fa), val(taxonid)   [storeDir moves .fa; workflow maps to abs string]
-//   → writes <asmid>.fa to input_clean_genomes/ (storeDir; skip check targets this file)
-//   → purge/FCS intermediates written as side effects to input_clean_genomes/clean/
-// MASKREPEAT_TANTAN_RUN receives: ..., val(genome_fa), val(taxonid)
-//   → emits: ..., path(masked_fa), val(taxonid)   [storeDir caches input_clean_genomes/<asmid>.masked.fasta]
-//   [skipped unless --run_repeatmasker; masked_fa falls back to unmasked .fa if .masked.fasta absent]
-// SRA_FETCH receives: val(species_tag), val(taxonid)   [only when --run_sra_fetch; one per species]
-//   → emits: val(species_tag), path(norm_R1.fastq.gz), path(norm_R2.fastq.gz)
-//   → storeDir caches normalized reads at rnaseq_reads/<species_tag>_norm_{R1,R2}.fastq.gz
-//   → empty files (0 bytes) written when no RNA-seq found; downstream checks size to skip
-//   → SRA_FETCH handles: download → fastp trim → bbnorm normalization internally
-// --stop_after_sra_fetch: when true, pipeline halts after SRA_FETCH (skips RNASEQ_PREPARE,
-//   FUNANNOTATE_TRAIN, FUNANNOTATE_PREDICT and all downstream steps).
-// RNASEQ_PREPARE receives: ..., val(genome_fa), path(norm_r1), path(norm_r2)   [representative only]
+// Data contract: every channel element is `tuple val(meta), val/path(genome)`.
+// meta is a Map built by SampleUtils.makeMeta(row) — see lib/SampleUtils.groovy.
+//   meta.id is the ONLY field used for tag{} and file naming.
+//   meta.asmid, meta.species, meta.strain, meta.locustag, meta.busco,
+//   meta.transl_table, meta.taxonid carry payload used inside process scripts.
+//   header_length is NOT in meta — it comes from params.header_length (default 24).
+//
+// GENOME_CLEAN receives: tuple val(meta), path(genome_gz), val(taxondb)
+//   → emits: tuple val(meta), path(genome_fa)   [storeDir writes input_clean_genomes/<asmid>.fa.gz]
+// MASKREPEAT_TANTAN_RUN receives: tuple val(meta), val(genome_fa)
+//   → emits: tuple val(meta), path(masked_fa)   [storeDir caches input_clean_genomes/<asmid>.masked.fasta.gz]
+// SRA_FETCH receives: val(species_tag), val(taxonid)   [only when --run_sra_fetch]
+//   → emits: val(species_tag), path(norm_R1.fastq.gz), path(norm_R2.fastq.gz), path(se)
+// RNASEQ_PREPARE receives: tuple val(species_tag), val(meta), val(genome_fa), path(r1), path(r2), path(se)
 //   → emits: val(species_tag), path(trinity-GG.fasta)   [storeDir caches in rnaseq_data/]
-//   → normalized reads stay in rnaseq_reads/ and are NOT re-emitted from RNASEQ_PREPARE
-// FUNANNOTATE_TRAIN receives: ..., val(genome_fa), path(norm_r1), path(norm_r2), path(trinity_fa)
-//   → norm reads come directly from SRA_FETCH; trinity_fa from RNASEQ_PREPARE
-//   → emits: ..., val(genome_fa)
-// FUNANNOTATE_PREDICT receives: ..., val(genome_fa)   [from TRAIN or directly after masking/clean]
+// FUNANNOTATE_TRAIN receives: tuple val(meta), val(genome_fa), path(r1), path(r2), path(se), path(trinity_fa)
+//   → emits: tuple val(meta), val(genome_fa)
+// FUNANNOTATE_PREDICT receives: tuple val(meta), val(genome_fa)
+//   → emits metadata: tuple val(meta)
 
 // Download and extract NCBI taxdump once; storeDir caches it at params.taxondb so
 // subsequent runs skip this entirely.
@@ -173,7 +168,7 @@ process SETUP_AUGUSTUS_CONFIG {
 
 process GENOME_CLEAN {
     label 'genome_clean'
-    tag "$asmid"
+    tag "${meta.id}"
 
     // container '/rhome/jstajich/projects/AAFTF/AAFTF_v0.6.1-signed.sif'
 
@@ -185,16 +180,15 @@ process GENOME_CLEAN {
     time   '6h'
 
     input:
-    tuple val(out), val(asmid), val(species), val(strain), val(locustag),
-          val(busco_lineage), val(header_length), val(transl_table),
-          path(genome_gz), val(taxonid), val(taxondb)
+    tuple val(meta), path(genome_gz), val(taxondb)
 
     output:
-    tuple val(out), val(asmid), val(species), val(strain), val(locustag),
-          val(busco_lineage), val(header_length), val(transl_table),
-          path("${asmid}.fa.gz"), val(taxonid), emit: genome
+    tuple val(meta), path("${meta.asmid}.fa.gz"), emit: genome
 
     script:
+    def out      = meta.id
+    def asmid    = meta.asmid
+    def taxonid  = meta.taxonid
     """
     if [ ! -f "${genome_gz}" ]; then
         echo "ERROR: genome_gz not found at path: ${genome_gz}" >&2
@@ -250,6 +244,7 @@ process GENOME_CLEAN {
     """
 
     stub:
+    def asmid = meta.asmid
     """
     echo ">stub_${asmid}" | pigz -c > ${asmid}.fa.gz
     mkdir -p ${launchDir}/input_clean_genomes/clean
@@ -287,7 +282,7 @@ process GENOME_CLEAN_BATCH {
     path "clean_batch_*.manifest.tsv", emit: manifest
 
     script:
-    def batch_tsv = items.collect { row -> "${row[1]}\t${row[8]}\t${row[9]}" }.join('\n')
+    def batch_tsv = items.collect { row -> "${row[0].asmid}\t${row[1]}\t${row[0].taxonid}" }.join('\n')
     """
     set -uo pipefail
     source /etc/profile.d/modules.sh 2>/dev/null || true
@@ -374,7 +369,7 @@ BATCH_EOF
     """
 
     stub:
-    def batch_tsv = items.collect { row -> "${row[1]}\t${row[8]}\t${row[9]}" }.join('\n')
+    def batch_tsv = items.collect { row -> "${row[0].asmid}\t${row[1]}\t${row[0].taxonid}" }.join('\n')
     """
     DEST=${launchDir}/input_clean_genomes
     mkdir -p \$DEST/clean
@@ -396,7 +391,7 @@ BATCH_EOF
 // storeDir caches the masked FASTA alongside the clean genome.
 process MASKREPEAT_TANTAN_RUN {
     label 'funannotate'
-    tag "$asmid"
+    tag "${meta.id}"
 
     storeDir "${launchDir}/input_clean_genomes"
 
@@ -405,16 +400,13 @@ process MASKREPEAT_TANTAN_RUN {
     time   '2h'
 
     input:
-    tuple val(out), val(asmid), val(species), val(strain), val(locustag),
-          val(busco_lineage), val(header_length), val(transl_table),
-          val(genome_fa), val(taxonid)
+    tuple val(meta), val(genome_fa)
 
     output:
-    tuple val(out), val(asmid), val(species), val(strain), val(locustag),
-          val(busco_lineage), val(header_length), val(transl_table),
-          path("${asmid}.masked.fasta.gz"), val(taxonid), emit: masked
+    tuple val(meta), path("${meta.asmid}.masked.fasta.gz"), emit: masked
 
     script:
+    def asmid = meta.asmid
     """
     source /etc/profile.d/modules.sh 2>/dev/null || true
     # Inflate a gzipped clean genome to a local uncompressed copy; funannotate cannot
@@ -430,6 +422,7 @@ process MASKREPEAT_TANTAN_RUN {
     """
 
     stub:
+    def asmid = meta.asmid
     """
     echo ">stub_${asmid}_masked" | pigz -c > ${asmid}.masked.fasta.gz
     """
@@ -1117,15 +1110,17 @@ process RNASEQ_PREPARE {
     time   '120h'
 
     input:
-    tuple val(species_tag), val(out), val(asmid), val(species), val(strain), val(locustag),
-          val(busco_lineage), val(header_length), val(transl_table),
-          val(genome_fa), path(r1), path(r2), path(se)
+    tuple val(species_tag), val(meta), val(genome_fa), path(r1), path(r2), path(se)
 
     output:
     tuple val(species_tag),
             path("${species_tag}.trinity-GG.fasta"), emit: shared
 
     script:
+    def out           = meta.id
+    def species       = meta.species
+    def strain        = meta.strain
+    def header_length = params.header_length
     """
     # ── Empty-reads sentinel: no RNA-seq found by SRA_FETCH / SRA_FETCH_SE ──
     if [ ! -s "${r1}" ] && [ ! -s "${se}" ]; then
@@ -1204,6 +1199,7 @@ process RNASEQ_PREPARE {
     """
 
     stub:
+    def out = meta.id
     """
     echo ">stub_trinity_${species_tag}" > ${species_tag}.trinity-GG.fasta
     mkdir -p ${params.training_target}/${out}/training
@@ -1217,23 +1213,25 @@ process RNASEQ_PREPARE {
 // a single strain or when run_sra_fetch is false).
 process FUNANNOTATE_TRAIN {
     label 'funannotate'
-    tag "$out"
+    tag "${meta.id}"
 
     cpus   16
     memory '96 GB'
     time   '120h'
 
     input:
-    tuple val(out), val(asmid), val(species), val(strain), val(locustag),
-          val(busco_lineage), val(header_length), val(transl_table),
-          val(genome_fa), path(r1), path(r2), path(se), path(trinity_fa)
+    tuple val(meta), val(genome_fa), path(r1), path(r2), path(se), path(trinity_fa)
 
     output:
-    tuple val(out), val(asmid), val(species), val(strain), val(locustag),
-          val(busco_lineage), val(header_length), val(transl_table),
-          val(genome_fa)
+    tuple val(meta), val(genome_fa)
 
     script:
+    def out           = meta.id
+    def asmid         = meta.asmid
+    def species       = meta.species
+    def strain        = meta.strain
+    def locustag      = meta.locustag
+    def header_length = params.header_length
     def pasa_db_arg = "--pasa_db sqlite"
     """
     # ── Skip if no RNA-seq data at all ────────────────────────────────────────
@@ -1380,6 +1378,7 @@ process FUNANNOTATE_TRAIN {
     """
 
     stub:
+    def out = meta.id
     """
     echo "[STUB] FUNANNOTATE_TRAIN stub for ${out}"
     mkdir -p ${params.training_target}/${out}/training
@@ -1398,23 +1397,28 @@ process FUNANNOTATE_TRAIN {
 // on-disk GBK), so emitting a marker keeps the DAG edge without copying the result tree.
 process FUNANNOTATE_PREDICT {
     label 'funannotate'
-    tag "$out"
+    tag "${meta.id}"
 
     cpus   16
     memory '32 GB'
     time   '32h'
 
     input:
-    tuple val(out), val(asmid), val(species), val(strain), val(locustag),
-          val(busco_lineage), val(header_length), val(transl_table),
-          val(genome_fa)
+    tuple val(meta), val(genome_fa)
 
     output:
-    tuple val(out), val(asmid), val(species), val(strain), val(locustag),
-          val(busco_lineage), val(header_length), val(transl_table), emit: metadata
-    path("${out}.predict.done"), emit: done
+    val meta, emit: metadata
+    path("${meta.id}.predict.done"), emit: done
 
     script:
+    def out           = meta.id
+    def asmid         = meta.asmid
+    def species       = meta.species
+    def strain        = meta.strain
+    def locustag      = meta.locustag
+    def busco_lineage = meta.busco
+    def header_length = params.header_length
+    def transl_table  = meta.transl_table
     """
     source /etc/profile.d/modules.sh 2>/dev/null || true
     module load funannotate/dev-1.8.18
@@ -1554,6 +1558,7 @@ process FUNANNOTATE_PREDICT {
     """
 
     stub:
+    def out = meta.id
     """
     echo "[STUB] Would run funannotate predict for ${out} using ${genome_fa}"
     [ -f "${genome_fa}" ] || [ -f "${genome_fa}.gz" ] || { echo "ERROR: genome not found at ${genome_fa}[.gz]" >&2; exit 1; }
@@ -1567,7 +1572,7 @@ process FUNANNOTATE_PREDICT {
 
 process ANTISMASH_RUN {
     label 'antismash'
-    tag "$out"
+    tag "${meta.id}"
 
     cpus   8
     memory '16 GB'
@@ -1576,13 +1581,13 @@ process ANTISMASH_RUN {
     publishDir "${params.target}", mode: 'copy', overwrite: true
 
     input:
-    tuple val(out), val(asmid), val(species), val(strain), val(locustag),
-          val(busco_lineage), val(header_length), val(transl_table)
+    val(meta)
 
     output:
-    tuple val(out), path("${out}/antismash_local/**")
+    tuple val(meta), path("${meta.id}/antismash_local/**")
 
     script:
+    def out = meta.id
     def gbk = "${params.target}/${out}/predict_results/${out}.gbk"
     """
     # Accept a compressed prediction (.gbk.gz); antismash needs it uncompressed, so
@@ -1608,6 +1613,7 @@ process ANTISMASH_RUN {
     """
 
     stub:
+    def out = meta.id
     """
     mkdir -p ${out}/antismash_local
     touch ${out}/antismash_local/${out}.json.gz
@@ -1618,7 +1624,7 @@ process ANTISMASH_RUN {
 // IPRSCAN5
 process INTERPROSCAN_RUN {
     label 'interproscan'
-    tag "$out"
+    tag "${meta.id}"
 
     cpus   8
     memory '32 GB'
@@ -1627,13 +1633,13 @@ process INTERPROSCAN_RUN {
     publishDir "${params.target}", mode: 'copy', overwrite: true
 
     input:
-    tuple val(out), val(asmid), val(species), val(strain), val(locustag),
-          val(busco_lineage), val(header_length), val(transl_table)
+    val(meta)
 
     output:
-    tuple val(out), path("${out}/annotate_misc/iprscan.xml")
+    tuple val(meta), path("${meta.id}/annotate_misc/iprscan.xml")
 
     script:
+    def out      = meta.id
     def proteins = "${params.target}/${out}/predict_results/${out}.proteins.fa"
     """
     if [ ! -f "${proteins}" ]; then
@@ -1646,6 +1652,7 @@ process INTERPROSCAN_RUN {
     """
 
     stub:
+    def out = meta.id
     """
     mkdir -p ${out}/annotate_misc
     touch ${out}/annotate_misc/iprscan.xml
@@ -1654,7 +1661,7 @@ process INTERPROSCAN_RUN {
 
 process SIGNALP_RUN {
     label 'signalp'
-    tag "$out"
+    tag "${meta.id}"
 
     cpus   8
     memory '16 GB'
@@ -1663,13 +1670,13 @@ process SIGNALP_RUN {
     publishDir "${params.target}", mode: 'copy', overwrite: true
 
     input:
-    tuple val(out), val(asmid), val(species), val(strain), val(locustag),
-          val(busco_lineage), val(header_length), val(transl_table)
+    val(meta)
 
     output:
-    tuple val(out), path("${out}/annotate_misc/signalp.results.txt")
+    tuple val(meta), path("${meta.id}/annotate_misc/signalp.results.txt")
 
     script:
+    def out      = meta.id
     def proteins = "${params.target}/${out}/predict_results/${out}.proteins.fa"
     """
     if [ ! -f "${proteins}" ]; then
@@ -1687,6 +1694,7 @@ process SIGNALP_RUN {
     """
 
     stub:
+    def out = meta.id
     """
     mkdir -p ${out}/annotate_misc
     touch ${out}/annotate_misc/signalp.results.txt
@@ -1695,21 +1703,26 @@ process SIGNALP_RUN {
 
 process FUNANNOTATE_ANNOTATE {
     label 'funannotate'
-    tag "$out"
+    tag "${meta.id}"
 
     cpus   16
     memory '32 GB'
     time   '48h'
 
     input:
-    tuple val(out), val(asmid), val(species), val(strain), val(locustag),
-          val(busco_lineage), val(header_length), val(transl_table)
+    val(meta)
 
     output:
-    tuple val(out), path("${out}.annotate.done"), emit: marker
+    tuple val(meta), path("${meta.id}.annotate.done"), emit: marker
 
     script:
-    def antiSm    = file("${params.target}/${out}/antismash_local/${out}.gbk")
+    def out           = meta.id
+    def species       = meta.species
+    def strain        = meta.strain
+    def locustag      = meta.locustag
+    def busco_lineage = meta.busco
+    def header_length = params.header_length
+    def antiSm    = file("${params.target}/${meta.id}/antismash_local/${meta.id}.gbk")
     def antiSmArg = antiSm.exists() ? "--antismash ${antiSm}" : ""
     """
     source /etc/profile.d/modules.sh 2>/dev/null || true
@@ -1735,6 +1748,7 @@ process FUNANNOTATE_ANNOTATE {
     """
 
     stub:
+    def out = meta.id
     """
     echo "[STUB] Would run funannotate annotate for ${out}"
     mkdir -p ${params.target}/${out}/annotate_results ${params.target}/${out}/annotate_misc
@@ -1745,22 +1759,26 @@ process FUNANNOTATE_ANNOTATE {
 
 process FUNANNOTATE_UPDATE {
     label 'funannotate'
-    tag "$out"
+    tag "${meta.id}"
 
     cpus   16
     memory '96 GB'
     time   '48h'
 
     input:
-    tuple val(out), val(asmid), val(species), val(strain), val(locustag),
-          val(busco_lineage), val(header_length), val(transl_table),
-          path(r1), path(r2)
+    tuple val(meta), path(r1), path(r2)
 
     output:
-    tuple val(out), val(asmid), val(species), val(strain), val(locustag),
-          val(busco_lineage), val(header_length), val(transl_table)
+    val meta
 
     script:
+    def out           = meta.id
+    def asmid         = meta.asmid
+    def species       = meta.species
+    def strain        = meta.strain
+    def locustag      = meta.locustag
+    def busco_lineage = meta.busco
+    def header_length = params.header_length
     def pasa_db_arg = "--pasa_db sqlite"
     """
     # ── Skip if no reads (empty marker file from SRA_FETCH) ──────────────────
@@ -1828,6 +1846,7 @@ process FUNANNOTATE_UPDATE {
     """
 
     stub:
+    def out = meta.id
     """
     echo "[STUB] FUNANNOTATE_UPDATE stub for ${out} (r1=${r1}, r2=${r2})"
     mkdir -p ${params.target}/${out}/update_results
@@ -1938,46 +1957,35 @@ workflow {
         .filter(taxonFilter)
         .filter(asmidFilter)
         .map { row ->
-            def species       = (row.SPECIES?.trim() ?: '').replaceAll(/['"]/, '')
-            def strain        = (row.STRAIN?.trim() ?: '').replaceAll(/['"]/, '').replaceAll(/;.*$/, '').trim().replace(':', ' ')
-            def out           = SampleUtils.makeSampleTag(row.SPECIES?.trim() ?: '', row.STRAIN?.trim() ?: '')
-            def asmid         = row.ASMID?.trim()
-            def locustag      = row.LOCUSTAG?.replaceAll(/[\r\n]/, '')?.trim()
-            def busco         = row.BUSCO_LINEAGE?.trim()
-            def header_length = 24
-            def transl_table  = row.TRANSL_TABLE?.trim() ?: '1'
-            def taxonid       = row.NCBI_TAXONID?.trim()
-            // Dual input model: a non-empty GENOME column points directly at a local
-            // assembly FASTA (.fa/.fna[.gz]); otherwise resolve from the NCBI_ASM
-            // source dir by ASMID. Relative GENOME paths resolve against launchDir.
-            def genome_col    = row.GENOME?.trim()
+            def meta = SampleUtils.makeMeta(row)
+            def genome_col = row.GENOME?.trim()
             def gz = genome_col
                 ? (genome_col.startsWith('/') ? file(genome_col) : file("${launchDir}/${genome_col}"))
-                : file("${params.source}/${asmid}/${asmid}_genomic.fna.gz")
-            tuple(out, asmid, species, strain, locustag, busco, header_length, transl_table, gz, taxonid)
+                : file("${params.source}/${meta.asmid}/${meta.asmid}_genomic.fna.gz")
+            tuple(meta, gz)
         }
-        .filter { out, asmid, _sp, _st, _lt, _bl, _hl, _tt, _gz, _tid -> out && asmid }
+        .filter { meta, gz -> meta.id && meta.asmid }
         .take((params.n_test as int) > 0 ? params.n_test as int : -1)
-        .filter { out, asmid, _sp, _st, _lt, _bl, _hl, _tt, _gz, _tid ->
-            if (suppressSet.contains(asmid)) {
-                log.info "Suppressing ${out} (asmid=${asmid})"
+        .filter { meta, gz ->
+            if (suppressSet.contains(meta.asmid)) {
+                log.info "Suppressing ${meta.id} (asmid=${meta.asmid})"
                 return false
             }
             return true
         }
-        .filter { out, asmid, _sp, _st, _lt, _bl, _hl, _tt, gz, _tid ->
+        .filter { meta, gz ->
             if (!gz.exists()) {
-                log.warn "Missing genome for ${out} (asmid=${asmid}): ${gz}"
+                log.warn "Missing genome for ${meta.id} (asmid=${meta.asmid}): ${gz}"
                 return false
             }
             if (params.debug.toBoolean()) {
-                log.info "Queuing ${out}: genome=${gz} (${gz.size()} bytes)"
+                log.info "Queuing ${meta.id}: genome=${gz} (${gz.size()} bytes)"
             }
             return true
         }
 
     if (params.debug.toBoolean()) {
-        jobs.view { t -> "[CHANNEL] Submitting: out=${t[0]}, asmid=${t[1]}, transl_table=${t[7]}, gz=${t[8]}" }
+        jobs.view { meta, gz -> "[CHANNEL] Submitting: out=${meta.id}, asmid=${meta.asmid}, transl_table=${meta.transl_table}, gz=${gz}" }
     }
 
     // Ensure taxondb is populated before any GENOME_CLEAN task starts.
@@ -1989,8 +1997,8 @@ workflow {
     // from being padded with finished genomes — a batch that is entirely cleaned is never
     // scheduled, so it never pays the ~30-min /dev/shm staging cost. (GENOME_CLEAN_BATCH
     // also re-checks per genome at runtime, which handles partial completion on retry.)
-    def jobs_to_clean = jobs.filter { tup ->
-        !genomeFile("${launchDir}/input_clean_genomes/${tup[1]}.fa").exists()
+    def jobs_to_clean = jobs.filter { meta, gz ->
+        !genomeFile("${launchDir}/input_clean_genomes/${meta.asmid}.fa").exists()
     }
 
     // Genome cleaning. The FCS-GX DB staging into /dev/shm costs ~30 min per task, so by
@@ -2012,7 +2020,7 @@ workflow {
         clean_done_ch = GENOME_CLEAN_BATCH.out.manifest.collect().ifEmpty([])
     } else {
         GENOME_CLEAN(jobs_to_clean.combine(taxondb_ch))
-        clean_done_ch = GENOME_CLEAN.out.genome.map { it[8] }.collect().ifEmpty([])
+        clean_done_ch = GENOME_CLEAN.out.genome.map { meta, gz -> gz }.collect().ifEmpty([])
     }
 
     if (!params.only_clean.toBoolean()) {
@@ -2022,32 +2030,25 @@ workflow {
         // clean_done_ch (combine waits until all cleaning is done). genome_fa is emitted as
         // an absolute-path string so downstream val(genome_fa) processes reference the file
         // directly without Nextflow re-staging it.
+        // Note: combine on jobs (a [meta,gz] tuple) appends clean_done_ch as a third element;
+        // we drop gz and the sentinel together. Keeping the tuple avoids emitting a bare Map
+        // (which Nextflow's combine may flatten unexpectedly).
         def clean_genome_ch = jobs
-            .map { out, asmid, species, strain, locustag, busco, hlen, ttable, _gz, taxonid ->
-                tuple(out, asmid, species, strain, locustag, busco, hlen, ttable, taxonid)
-            }
-            .combine(clean_done_ch)            // gate: blocks until all cleaning is done
-            .map { row -> row[0..8] }          // drop the clean_done sentinel element
-            // Resolve the cleaned genome AFTER the gate so the just-written <asmid>.fa.gz
-            // (or legacy .fa) is visible — genomeFile prefers the compressed form. Resolving
-            // before the combine would freeze the path at construction time (pre-clean), when
-            // neither file exists yet, and the .exists() filter below would drop every genome.
-            .map { out, asmid, species, strain, locustag, busco, hlen, ttable, taxonid ->
-                def g = genomeFile("${launchDir}/input_clean_genomes/${asmid}.fa")
-                tuple(out, asmid, species, strain, locustag, busco, hlen, ttable, g, taxonid)
-            }
-            .filter { tup ->
-                if (!tup[8].exists()) {
-                    log.warn "No cleaned genome for ${tup[0]} (asmid=${tup[1]}) — skipping downstream"
+            .combine(clean_done_ch)            // gate: blocks until cleaning done
+            // Use it[0] (meta) rather than destructuring: combine with ifEmpty([]) produces
+            // a variable-length tuple — 2 elements when the sentinel is empty, 3+ when it
+            // carries collected paths. A fixed-arity { meta, _gz, _sentinel -> } fails on
+            // the 2-element case, so we index into the element directly.
+            .map { tuple(it[0], genomeFile("${launchDir}/input_clean_genomes/${it[0].asmid}.fa")) }
+            .filter { meta, g ->
+                if (!g.exists()) {
+                    log.warn "No cleaned genome for ${meta.id} (asmid=${meta.asmid}) — skipping downstream"
                     return false
                 }
                 return true
             }
-            // genome_fa as an absolute-path string so downstream val(genome_fa) processes
-            // reference the file directly without Nextflow re-staging it.
-            .map { out, asmid, species, strain, locustag, busco, hlen, ttable, genome_fa, taxonid ->
-                tuple(out, asmid, species, strain, locustag, busco, hlen, ttable,
-                      genome_fa.toAbsolutePath().toString(), taxonid)
+            .map { meta, genome_fa ->
+                tuple(meta, genome_fa.toAbsolutePath().toString())
             }
 
         // ── Generate assembly statistics (for earlgrey_mask.nf SELECT_REPS) ────────
@@ -2075,20 +2076,19 @@ workflow {
         if (params.run_repeatmasker.toBoolean()) {
             MASKREPEAT_TANTAN_RUN(clean_genome_ch)
             predict_genome_ch = MASKREPEAT_TANTAN_RUN.out.masked
-                .map { out, asmid, species, strain, locustag, busco, hlen, ttable, masked_fa, taxonid ->
-                    tuple(out, asmid, species, strain, locustag, busco, hlen, ttable,
-                        masked_fa.toAbsolutePath().toString(), taxonid)
+                .map { meta, masked_fa ->
+                    tuple(meta, masked_fa.toAbsolutePath().toString())
                 }
         } else {
             // --run_repeatmasker false: use masked genome if a prior run produced it, else unmasked.
             predict_genome_ch = clean_genome_ch
-                .map { out, asmid, species, strain, locustag, busco, hlen, ttable, genome_fa, taxonid ->
-                    def masked = genomeFile("${launchDir}/input_clean_genomes/${asmid}.masked.fasta")
+                .map { meta, genome_fa ->
+                    def masked = genomeFile("${launchDir}/input_clean_genomes/${meta.asmid}.masked.fasta")
                     def use_fa = masked.exists() ? masked.toString() : genome_fa
                     if (params.debug.toBoolean()) {
-                        log.info "[DEBUG] ${asmid}: genome_fa=${use_fa} (masked=${masked.exists()})"
+                        log.info "[DEBUG] ${meta.asmid}: genome_fa=${use_fa} (masked=${masked.exists()})"
                     }
-                    tuple(out, asmid, species, strain, locustag, busco, hlen, ttable, use_fa, taxonid)
+                    tuple(meta, use_fa)
                 }
         }
 
@@ -2115,9 +2115,9 @@ workflow {
         if (params.run_sra_fetch.toBoolean()) {
             // Build per-species input: group assemblies, keep first taxonid per species.
             def sra_input = predict_genome_ch
-                .map { out, asmid, species, strain, locustag, busco, hlen, ttable, genome_fa, taxonid ->
-                    def species_tag = species.replaceAll(/\s+/, '_')
-                    tuple(species_tag, taxonid)
+                .map { meta, genome_fa ->
+                    def species_tag = meta.species.replaceAll(/\s+/, '_')
+                    tuple(species_tag, meta.taxonid)
                 }
                 .groupTuple(by: 0)
                 .map { species_tag, taxonids -> tuple(species_tag, taxonids[0]) }
@@ -2233,13 +2233,12 @@ workflow {
             // Build per-assembly channel keyed by species_tag with SRA reads joined.
             // reads_ch is now a 4-tuple: (species_tag, r1, r2, se)
             def assembly_with_reads = predict_genome_ch
-                .map { out, asmid, species, strain, locustag, busco, hlen, ttable, genome_fa, taxonid ->
-                    def species_tag = species.replaceAll(/\s+/, '_')
-                    tuple(species_tag, out, asmid, species, strain, locustag, busco, hlen, ttable, genome_fa)
+                .map { meta, genome_fa ->
+                    def species_tag = meta.species.replaceAll(/\s+/, '_')
+                    tuple(species_tag, meta, genome_fa)
                 }
                 .combine(reads_ch, by: 0)
-            // assembly_with_reads tuple: (species_tag, out, asmid, species, strain, locustag,
-            //                             busco, hlen, ttable, genome_fa, r1, r2, se)
+            // assembly_with_reads: (species_tag, meta, genome_fa, r1, r2, se)
 
             // RNASEQ_PREPARE: run funannotate train --stop_after_trinity once per species on
             // the representative (first) assembly, then cache the Trinity-GG FASTA in rnaseq_data/
@@ -2250,14 +2249,12 @@ workflow {
             // entirely; an empty trinity FASTA is written locally without submitting a SLURM job.
             def repr_ch = assembly_with_reads
                 .groupTuple(by: 0)
-                .map { species_tag, outs, asmids, species_list, strains, locustags,
-                       buscos, hlens, ttables, genomes, r1s, r2s, ses ->
-                    tuple(species_tag, outs[0], asmids[0], species_list[0], strains[0],
-                          locustags[0], buscos[0], hlens[0], ttables[0], genomes[0], r1s[0], r2s[0], ses[0])
+                .map { species_tag, metas, genomes, r1s, r2s, ses ->
+                    tuple(species_tag, metas[0], genomes[0], r1s[0], r2s[0], ses[0])
                 }
 
             def repr_branched = repr_ch.branch {
-                has_reads: it[10].size() > 0 || it[12].size() > 0  // r1=[10] or se=[12]
+                has_reads: it[3].size() > 0 || it[5].size() > 0   // r1=[3] or se=[5]
                 no_reads:  true
             }
 
@@ -2266,7 +2263,7 @@ workflow {
             // For species with no RNA-seq reads, write an empty trinity FASTA to rnaseq_data/
             // in the driver process (no SLURM job) and emit it directly as a shared channel item.
             def empty_shared_ch = repr_branched.no_reads
-                .map { species_tag, _out, _asmid, _sp, _st, _lt, _bl, _hl, _tt, _gfa, _r1, _r2, _se ->
+                .map { species_tag, _meta, _gfa, _r1, _r2, _se ->
                     def empty_fa = file("${launchDir}/rnaseq_data/${species_tag}.trinity-GG.fasta")
                     if (!empty_fa.exists()) {
                         empty_fa.parent.mkdirs()
@@ -2281,37 +2278,36 @@ workflow {
             // Normalized reads (r1/r2/se) come from SRA_FETCH/SRA_FETCH_SE via assembly_with_reads.
             def train_input = assembly_with_reads
                 .combine(shared_ch, by: 0)
-                .map { species_tag, out, asmid, sp, st, lt, bl, hl, tt, genome_fa, r1, r2, se, trinity_fa ->
-                    tuple(out, asmid, sp, st, lt, bl, hl, tt, genome_fa, r1, r2, se, trinity_fa)
+                .map { species_tag, meta, genome_fa, r1, r2, se, trinity_fa ->
+                    tuple(meta, genome_fa, r1, r2, se, trinity_fa)
                 }
-            // train_input tuple indices: out=0,asmid=1,sp=2,st=3,lt=4,bl=5,hl=6,tt=7,
-            //                            genome_fa=8, r1=9, r2=10, se=11, trinity_fa=12
+            // train_input: meta=0, genome_fa=1, r1=2, r2=3, se=4, trinity_fa=5
 
-            // Branch on r1 (idx 9), se (idx 11), or trinity_fa (idx 12) sizes.
+            // Branch on r1 (idx 2), se (idx 4), or trinity_fa (idx 5) sizes.
             // Assemblies with no RNA-seq bypass FUNANNOTATE_TRAIN entirely.
             def branched = train_input.branch {
-                has_rnaseq: it[9].size() > 0 || it[11].size() > 0 || it[12].size() > 0
+                has_rnaseq: it[2].size() > 0 || it[4].size() > 0 || it[5].size() > 0
                 no_rnaseq:  true
             }
             def predict_no_rnaseq = branched.no_rnaseq
-                .map { out, asmid, sp, st, lt, bl, hl, tt, genome_fa, _r1, _r2, _se, _tf ->
-                    tuple(out, asmid, sp, st, lt, bl, hl, tt, genome_fa)
+                .map { meta, genome_fa, _r1, _r2, _se, _tf ->
+                    tuple(meta, genome_fa)
                 }
 
             // Skip TRAIN at the channel level when pasa.gff3 already exists and is non-empty,
             // UNLESS the rnaseq reads or trinity FASTA is newer than the existing prediction GBK
             // (staleRnaseq), in which case we re-run training so predict can be refreshed too.
-            def train_todo = branched.has_rnaseq.filter { out, _a, sp, _st, _lt, _bl, _hl, _tt, _gfa, _r1, _r2, _se, _tf ->
-                def gff3 = file("${params.training_target}/${out}/training/funannotate_train.pasa.gff3")
-                !gff3.exists() || gff3.size() == 0 || staleRnaseq(out as String, sp as String)
+            def train_todo = branched.has_rnaseq.filter { meta, _gfa, _r1, _r2, _se, _tf ->
+                def gff3 = file("${params.training_target}/${meta.id}/training/funannotate_train.pasa.gff3")
+                !gff3.exists() || gff3.size() == 0 || staleRnaseq(meta.id as String, meta.species as String)
             }
             def train_done = branched.has_rnaseq
-                .filter { out, _a, sp, _st, _lt, _bl, _hl, _tt, _gfa, _r1, _r2, _se, _tf ->
-                    def gff3 = file("${params.training_target}/${out}/training/funannotate_train.pasa.gff3")
-                    gff3.exists() && gff3.size() > 0 && !staleRnaseq(out as String, sp as String)
+                .filter { meta, _gfa, _r1, _r2, _se, _tf ->
+                    def gff3 = file("${params.training_target}/${meta.id}/training/funannotate_train.pasa.gff3")
+                    gff3.exists() && gff3.size() > 0 && !staleRnaseq(meta.id as String, meta.species as String)
                 }
-                .map { out, asmid, sp, st, lt, bl, hl, tt, genome_fa, _r1, _r2, _se, _tf ->
-                    tuple(out, asmid, sp, st, lt, bl, hl, tt, genome_fa)
+                .map { meta, genome_fa, _r1, _r2, _se, _tf ->
+                    tuple(meta, genome_fa)
                 }
             FUNANNOTATE_TRAIN(train_todo)
             predict_input_ch = FUNANNOTATE_TRAIN.out.mix(train_done).mix(predict_no_rnaseq)
@@ -2319,15 +2315,12 @@ workflow {
             } // end if (!params.stop_after_sra_query)
         } else {
             predict_input_ch = predict_genome_ch
-                .map { out, asmid, species, strain, locustag, busco, hlen, ttable, genome_fa, _taxonid ->
-                    tuple(out, asmid, species, strain, locustag, busco, hlen, ttable, genome_fa)
-                }
         }
 
         if ((!params.stop_after_sra_fetch.toBoolean() && !params.stop_after_sra_query.toBoolean()) || !params.run_sra_fetch.toBoolean()) {
         def predict_ch = predict_input_ch
-            .filter { out, _asmid, sp, _st, _lt, _bl, _hl, _tt, _gfa ->
-                gbkResult("${params.target}/${out}/predict_results", out as String) == null || staleRnaseq(out as String, sp as String)
+            .filter { meta, _gfa ->
+                gbkResult("${params.target}/${meta.id}/predict_results", meta.id as String) == null || staleRnaseq(meta.id as String, meta.species as String)
             }
         FUNANNOTATE_PREDICT(predict_ch)
 
@@ -2339,27 +2332,17 @@ workflow {
             .splitCsv(header: true)
             .filter(taxonFilter)
             .filter(asmidFilter)
-            .map { row ->
-                def species       = (row.SPECIES?.trim() ?: '').replaceAll(/['"]/, '')
-                def strain        = (row.STRAIN?.trim() ?: '').replaceAll(/['"]/, '').replaceAll(/;.*$/, '').trim().replace(':', ' ')
-                def out           = SampleUtils.makeSampleTag(row.SPECIES?.trim() ?: '', row.STRAIN?.trim() ?: '')
-                def asmid         = row.ASMID?.trim()
-                def locustag      = row.LOCUSTAG?.replaceAll(/[\r\n]/, '')?.trim()
-                def busco         = row.BUSCO_LINEAGE?.trim()
-                def header_length = 24
-                def transl_table  = row.TRANSL_TABLE?.trim() ?: '1'
-                tuple(out, asmid, species, strain, locustag, busco, header_length, transl_table)
-            }
-            .filter { out, asmid, _sp, _st, _lt, _bl, _hl, _tt -> out && asmid }
+            .map { row -> SampleUtils.makeMeta(row) }
+            .filter { meta -> meta.id && meta.asmid }
             .take((params.n_test as int) > 0 ? params.n_test as int : -1)
-            .filter { out, asmid, _sp, _st, _lt, _bl, _hl, _tt -> !suppressSet.contains(asmid) }
+            .filter { meta -> !suppressSet.contains(meta.asmid) }
             // Only genomes whose prediction was already complete AND current in a PRIOR run.
             // This is the exact logical complement of the predict_ch filter, so this set is
             // disjoint from the genomes (re)predicted in THIS run (which arrive via
             // FUNANNOTATE_PREDICT.out.metadata below). Keeping them disjoint means no genome
             // is fed downstream twice and stale genomes correctly wait for the fresh predict.
-            .filter { out, _asmid, sp, _st, _lt, _bl, _hl, _tt ->
-                gbkResult("${params.target}/${out}/predict_results", out as String) != null && !staleRnaseq(out as String, sp as String)
+            .filter { meta ->
+                gbkResult("${params.target}/${meta.id}/predict_results", meta.id as String) != null && !staleRnaseq(meta.id as String, meta.species as String)
             }
 
         // annotate_ready_ch threads through optional pre-annotate steps. Each optional
@@ -2379,49 +2362,43 @@ workflow {
         def annotate_ready_ch = predict_meta
 
         if (params.run_antismash.toBoolean()) {
-            def as_todo = annotate_ready_ch.filter { out, _a, _sp, _st, _lt, _bl, _hl, _tt ->
-                def asDir = file("${params.target}/${out}/antismash_local")
+            def as_todo = annotate_ready_ch.filter { meta ->
+                def asDir = file("${params.target}/${meta.id}/antismash_local")
                 !(asDir.isDirectory() && asDir.list()?.any { it.endsWith('.json') || it.endsWith('.json.gz') })
             }
-            def as_done = annotate_ready_ch.filter { out, _a, _sp, _st, _lt, _bl, _hl, _tt ->
-                def asDir = file("${params.target}/${out}/antismash_local")
+            def as_done = annotate_ready_ch.filter { meta ->
+                def asDir = file("${params.target}/${meta.id}/antismash_local")
                 asDir.isDirectory() && asDir.list()?.any { it.endsWith('.json') || it.endsWith('.json.gz') }
             }
             ANTISMASH_RUN(as_todo)
             def as_completed = ANTISMASH_RUN.out
-                .map { out, _files -> tuple(out, 'done') }
-                .join(predict_meta)
-                .map { out, _flag, asmid, sp, st, lt, bl, hl, tt -> tuple(out, asmid, sp, st, lt, bl, hl, tt) }
+                .map { meta, _files -> meta }
             annotate_ready_ch = as_completed.mix(as_done)
         }
 
         if (params.run_interpro.toBoolean()) {
-            def ipr_todo = annotate_ready_ch.filter { out, _a, _sp, _st, _lt, _bl, _hl, _tt ->
-                !file("${params.target}/${out}/annotate_misc/iprscan.xml").exists()
+            def ipr_todo = annotate_ready_ch.filter { meta ->
+                !file("${params.target}/${meta.id}/annotate_misc/iprscan.xml").exists()
             }
-            def ipr_done = annotate_ready_ch.filter { out, _a, _sp, _st, _lt, _bl, _hl, _tt ->
-                file("${params.target}/${out}/annotate_misc/iprscan.xml").exists()
+            def ipr_done = annotate_ready_ch.filter { meta ->
+                file("${params.target}/${meta.id}/annotate_misc/iprscan.xml").exists()
             }
             INTERPROSCAN_RUN(ipr_todo)
             def ipr_completed = INTERPROSCAN_RUN.out
-                .map { out, _xml -> tuple(out, 'done') }
-                .join(predict_meta)
-                .map { out, _flag, asmid, sp, st, lt, bl, hl, tt -> tuple(out, asmid, sp, st, lt, bl, hl, tt) }
+                .map { meta, _xml -> meta }
             annotate_ready_ch = ipr_completed.mix(ipr_done)
         }
 
         if (params.run_signalp.toBoolean()) {
-            def sp_todo = annotate_ready_ch.filter { out, _a, _sp, _st, _lt, _bl, _hl, _tt ->
-                !file("${params.target}/${out}/annotate_misc/signalp.results.txt").exists()
+            def sp_todo = annotate_ready_ch.filter { meta ->
+                !file("${params.target}/${meta.id}/annotate_misc/signalp.results.txt").exists()
             }
-            def sp_done = annotate_ready_ch.filter { out, _a, _sp, _st, _lt, _bl, _hl, _tt ->
-                file("${params.target}/${out}/annotate_misc/signalp.results.txt").exists()
+            def sp_done = annotate_ready_ch.filter { meta ->
+                file("${params.target}/${meta.id}/annotate_misc/signalp.results.txt").exists()
             }
             SIGNALP_RUN(sp_todo)
             def sp_completed = SIGNALP_RUN.out
-                .map { out, _txt -> tuple(out, 'done') }
-                .join(predict_meta)
-                .map { out, _flag, asmid, sp, st, lt, bl, hl, tt -> tuple(out, asmid, sp, st, lt, bl, hl, tt) }
+                .map { meta, _txt -> meta }
             annotate_ready_ch = sp_completed.mix(sp_done)
         }
 
@@ -2431,37 +2408,38 @@ workflow {
                 // Reads are joined from SRA_FETCH (storeDir-cached, so prior-run reads are reused).
                 // The join on upd_signal gates annotate_ready_ch so ANNOTATE waits for UPDATE.
                 def upd_input = predict_meta
-                    .map { out, asmid, species, strain, locustag, busco, hlen, ttable ->
-                        def species_tag = species.replaceAll(/\s+/, '_')
-                        tuple(species_tag, out, asmid, species, strain, locustag, busco, hlen, ttable)
+                    .map { meta ->
+                        def species_tag = meta.species.replaceAll(/\s+/, '_')
+                        tuple(species_tag, meta)
                     }
                     .combine(reads_ch, by: 0)
-                    .map { _st, out, asmid, species, strain, locustag, busco, hlen, ttable, r1, r2 ->
-                        tuple(out, asmid, species, strain, locustag, busco, hlen, ttable, r1, r2)
+                    .map { _st, meta, r1, r2 ->
+                        tuple(meta, r1, r2)
                     }
-                def upd_todo = upd_input.filter { out, _a, _sp, _st, _lt, _bl, _hl, _tt, _r1, _r2 ->
-                    gbkResult("${params.target}/${out}/update_results", out as String) == null
+                def upd_todo = upd_input.filter { meta, _r1, _r2 ->
+                    gbkResult("${params.target}/${meta.id}/update_results", meta.id as String) == null
                 }
                 def upd_done_signal = upd_input
-                    .filter { out, _a, _sp, _st, _lt, _bl, _hl, _tt, _r1, _r2 ->
-                        gbkResult("${params.target}/${out}/update_results", out as String) != null
+                    .filter { meta, _r1, _r2 ->
+                        gbkResult("${params.target}/${meta.id}/update_results", meta.id as String) != null
                     }
-                    .map { out, _a, _sp, _st, _lt, _bl, _hl, _tt, _r1, _r2 -> tuple(out, 'upd') }
+                    .map { meta, _r1, _r2 -> tuple(meta.id, 'upd') }
                 FUNANNOTATE_UPDATE(upd_todo)
                 def upd_signal = FUNANNOTATE_UPDATE.out
-                    .map { out, _a, _sp, _st, _lt, _bl, _hl, _tt -> tuple(out, 'upd') }
+                    .map { meta -> tuple(meta.id, 'upd') }
                     .mix(upd_done_signal)
                 annotate_ready_ch = annotate_ready_ch
+                    .map { meta -> tuple(meta.id, meta) }
                     .join(upd_signal)
-                    .map { out, asmid, sp, st, lt, bl, hl, tt, _flag -> tuple(out, asmid, sp, st, lt, bl, hl, tt) }
+                    .map { _id, meta, _flag -> meta }
             } else {
                 log.warn "run_update=true but run_sra_fetch=false; funannotate update skipped (no reads available)"
             }
         }
 
         if (params.run_annotate.toBoolean()) {
-            FUNANNOTATE_ANNOTATE(annotate_ready_ch.filter { out, _a, _sp, _st, _lt, _bl, _hl, _tt ->
-                gbkResult("${params.target}/${out}/annotate_results", out as String) == null
+            FUNANNOTATE_ANNOTATE(annotate_ready_ch.filter { meta ->
+                gbkResult("${params.target}/${meta.id}/annotate_results", meta.id as String) == null
             })
         }
         } // end if (!params.stop_after_sra_fetch || !params.run_sra_fetch)
